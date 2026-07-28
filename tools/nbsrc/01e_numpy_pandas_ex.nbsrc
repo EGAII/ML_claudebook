@@ -1,0 +1,352 @@
+#out exercises/ex01_numpy_pandas.ipynb
+#gpu off
+
+#%% md
+# Exercise 1 - NumPy & pandas for image data
+
+Seven tasks. Each has a `TODO` and an `assert` block that tells you when you're right -
+if the cell runs without raising, you passed. Don't peek at
+[`solutions/sol01_numpy_pandas.ipynb`](solutions/sol01_numpy_pandas.ipynb) until you've
+either passed or been properly stuck for 10 minutes.
+
+Rules of the game:
+- No `for` loops over pixels anywhere (task 5 is the exception, and it's the point).
+- Prefer explaining the shape to yourself out loud before writing the line.
+
+**Setup cell first** - it builds the same little shapes dataset chapter 1 used.
+
+#%% code
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from PIL import Image, ImageDraw
+
+plt.rcParams['figure.dpi'] = 110
+plt.rcParams['image.cmap'] = 'gray'
+rng = np.random.default_rng(0)
+
+DATA = Path('data/shapes')
+CLASSES = ['circle', 'square', 'triangle']
+
+def draw_one(kind, size, r):
+    im = Image.new('L', (size, size), color=int(r.integers(10, 40)))
+    d = ImageDraw.Draw(im)
+    fill = int(r.integers(120, 255))
+    pad = int(r.integers(2, 6))
+    x0, y0 = int(r.integers(0, pad + 3)), int(r.integers(0, pad + 3))
+    x1, y1 = size - 1 - int(r.integers(0, pad + 3)), size - 1 - int(r.integers(0, pad + 3))
+    if kind == 'circle':
+        d.ellipse([x0, y0, x1, y1], fill=fill)
+    elif kind == 'square':
+        d.rectangle([x0, y0, x1, y1], fill=fill)
+    else:
+        d.polygon([(x0, y1), ((x0 + x1) // 2, y0), (x1, y1)], fill=fill)
+    return im
+
+def build_dataset(n_per_class=(40, 25, 15), seed=0):
+    r = np.random.default_rng(seed)
+    rows = []
+    for kind, n in zip(CLASSES, n_per_class):
+        (DATA / kind).mkdir(parents=True, exist_ok=True)
+        for i in range(n):
+            im = draw_one(kind, int(r.choice([28, 32, 40])), r)
+            p = DATA / kind / f'{kind}_{i:03d}.png'
+            im.save(p)
+            rows.append({'path': p.as_posix(), 'label': kind, 'width': im.width, 'height': im.height})
+    return pd.DataFrame(rows)
+
+manifest = Path('data/manifest_ex.csv')
+if manifest.exists():
+    df_raw = pd.read_csv(manifest)
+else:
+    df_raw = build_dataset()
+    df_raw.to_csv(manifest, index=False)
+
+def make_gradient_rgb(h=64, w=96):
+    ys, xs = np.mgrid[0:h, 0:w]
+    r = (255 * xs / (w - 1)).astype(np.uint8)
+    g = (255 * ys / (h - 1)).astype(np.uint8)
+    b = (255 * ((xs / (w - 1) + ys / (h - 1)) / 2)).astype(np.uint8)
+    return np.stack([r, g, b], axis=-1)
+
+print('setup ok:', len(df_raw), 'images |', DATA.resolve())
+
+#%% md
+---
+## Task 1 - HWC uint8 to normalized CHW float32
+
+Write `to_normalized_chw(img, mean, std)`:
+
+- input: `(H, W, 3)` `uint8` in 0-255, plus `mean`/`std` of shape `(3,)`
+- output: `(3, H, W)` `float32`, scaled to 0-1 **then** normalized per channel
+- the output must be C-contiguous (some libraries insist)
+
+Do it without loops, and don't use `reshape` to move the channel axis.
+
+#%% code
+def to_normalized_chw(img, mean, std):
+    """(H, W, 3) uint8  ->  (3, H, W) float32, normalized per channel."""
+    # TODO: your code here (about 4 lines)
+    raise NotImplementedError
+
+
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+test_img = make_gradient_rgb(64, 96)
+out = to_normalized_chw(test_img, IMAGENET_MEAN, IMAGENET_STD)
+
+assert out.shape == (3, 64, 96), f'expected (3, 64, 96), got {out.shape}'
+assert out.dtype == np.float32, f'expected float32, got {out.dtype}'
+assert out.flags['C_CONTIGUOUS'], 'result must be contiguous'
+expected_r = (test_img[..., 0].astype(np.float32) / 255.0 - IMAGENET_MEAN[0]) / IMAGENET_STD[0]
+assert np.allclose(out[0], expected_r, atol=1e-6), 'channel 0 values are wrong'
+assert not np.allclose(out[0], out[1]), 'channels look identical - did you normalize per channel?'
+print('PASS  out.shape =', out.shape, '| per-channel mean', out.mean(axis=(1, 2)).round(3))
+
+#%% md
+---
+## Task 2 - Center crop, as a view
+
+Write `center_crop(img, ch, cw)` returning the centred `ch x cw` region of an `(H, W, ...)`
+array. It must return a **view** (no copy), and it must raise `ValueError` if the requested
+crop is larger than the image.
+
+#%% code
+def center_crop(img, ch, cw):
+    """Centred crop of an (H, W, ...) array. Returns a view, not a copy."""
+    # TODO: your code here
+    raise NotImplementedError
+
+
+big = make_gradient_rgb(64, 96)
+crop = center_crop(big, 32, 32)
+
+assert crop.shape == (32, 32, 3), f'expected (32, 32, 3), got {crop.shape}'
+assert np.shares_memory(big, crop), 'must be a view - use basic slicing, not fancy indexing'
+assert np.array_equal(crop, big[16:48, 32:64]), 'crop is not centred'
+gray_in = big.mean(-1)
+assert center_crop(gray_in, 10, 10).shape == (10, 10), 'should work on (H, W) too'
+try:
+    center_crop(big, 100, 100)
+except ValueError:
+    print('PASS  crop', crop.shape, '| view:', np.shares_memory(big, crop), '| oversize raises ValueError')
+else:
+    raise AssertionError('an oversized crop should raise ValueError')
+
+#%% md
+---
+## Task 3 - Dataset statistics
+
+Given an NCHW batch, return the per-channel mean and std as two `(C,)` arrays - the numbers
+you would pass to `transforms.Normalize`. One line each.
+
+Then answer in the markdown cell below: why do we reduce over `(0, 2, 3)` and not `(0, 1, 2)`?
+
+#%% code
+def channel_stats(batch):
+    """(N, C, H, W) float32 -> (mean, std), each shape (C,)."""
+    # TODO: your code here
+    raise NotImplementedError
+
+
+fake = rng.random((16, 3, 8, 8), dtype=np.float32)
+fake[:, 0] *= 0.5          # make channel 0 clearly different
+m, s = channel_stats(fake)
+
+assert m.shape == (3,) and s.shape == (3,), f'expected (3,) each, got {m.shape} {s.shape}'
+assert np.allclose(m, fake.mean(axis=(0, 2, 3)), atol=1e-6), 'mean is wrong'
+assert np.allclose(s, fake.std(axis=(0, 2, 3)), atol=1e-6), 'std is wrong'
+assert m[0] < m[1], 'channel 0 was scaled down - did you reduce over the wrong axes?'
+print('PASS  mean', m.round(4), 'std', s.round(4))
+
+#%% md
+**Your answer:** we reduce over axes `(0, 2, 3)` because ...
+
+*(double-click to edit this cell)*
+
+---
+## Task 4 - Mask statistics and bounding boxes
+
+Two functions on a `(H, W)` integer label mask:
+
+1. `class_fractions(mask, num_classes)` -> `(num_classes,)` float array; entry `k` is the
+   fraction of pixels equal to `k`. Classes absent from the mask must give `0.0`, not be
+   skipped. (Hint: `np.bincount` with `minlength`.)
+2. `bbox(mask, cls)` -> `(y0, x0, y1, x1)` inclusive bounding box of class `cls`, or `None`
+   if that class is absent.
+
+#%% code
+def class_fractions(mask, num_classes):
+    """(H, W) int mask -> (num_classes,) float array of pixel fractions summing to 1."""
+    # TODO: your code here
+    raise NotImplementedError
+
+
+def bbox(mask, cls):
+    """Inclusive (y0, x0, y1, x1) bounding box of `cls`, or None if absent."""
+    # TODO: your code here
+    raise NotImplementedError
+
+
+mask = np.zeros((40, 60), dtype=np.int64)
+mask[5:15, 10:30] = 1        # 10 x 20 = 200 px
+mask[20:24, 40:50] = 2       # 4 x 10  =  40 px
+
+fr = class_fractions(mask, num_classes=5)
+assert fr.shape == (5,), f'expected (5,), got {fr.shape}'
+assert np.isclose(fr.sum(), 1.0), 'fractions must sum to 1'
+assert np.isclose(fr[1], 200 / mask.size) and np.isclose(fr[2], 40 / mask.size), 'wrong fractions'
+assert fr[3] == 0.0 and fr[4] == 0.0, 'absent classes must be 0.0'
+
+assert bbox(mask, 1) == (5, 10, 14, 29), f'class 1 bbox wrong: {bbox(mask, 1)}'
+assert bbox(mask, 2) == (20, 40, 23, 49), f'class 2 bbox wrong: {bbox(mask, 2)}'
+assert bbox(mask, 3) is None, 'absent class must return None'
+print('PASS  fractions', fr.round(4), '| bbox(1)', bbox(mask, 1))
+
+#%% md
+---
+## Task 5 - Kill the loop
+
+Below is a slow, correct gamma-correction function. Write a vectorized version with
+identical output. Then look at the printed speedup - that ratio is why we vectorize.
+
+#%% code
+def gamma_slow(img, gamma=2.2):
+    """Loop-based gamma correction on a (H, W) float image in 0..1."""
+    out = np.empty_like(img)
+    for i in range(img.shape[0]):
+        for j in range(img.shape[1]):
+            out[i, j] = min(max(img[i, j], 0.0), 1.0) ** (1.0 / gamma)
+    return out
+
+
+def gamma_fast(img, gamma=2.2):
+    """Same thing, no Python loops."""
+    # TODO: your code here (one line)
+    raise NotImplementedError
+
+
+test = rng.random((256, 256), dtype=np.float32)
+
+t0 = time.perf_counter(); slow = gamma_slow(test); t_slow = time.perf_counter() - t0
+t0 = time.perf_counter(); fast = gamma_fast(test); t_fast = time.perf_counter() - t0
+
+assert fast.shape == slow.shape, 'shape mismatch'
+assert np.allclose(slow, fast, atol=1e-6), 'values differ from the reference'
+assert t_fast < t_slow / 5, f'not fast enough: {t_slow * 1000:.1f}ms vs {t_fast * 1000:.1f}ms'
+print(f'PASS  slow {t_slow * 1000:7.2f} ms | fast {t_fast * 1000:6.2f} ms | {t_slow / t_fast:5.0f}x speedup')
+
+#%% md
+---
+## Task 6 - Manifest bookkeeping with pandas
+
+Starting from `df_raw` (columns: `path`, `label`, `width`, `height`), produce `df` with:
+
+- `class_id` - integer id from `CLASSES` (circle=0, square=1, triangle=2)
+- `area` - `width * height`
+- `aspect` - `width / height` as float
+- `is_large` - boolean, `area` strictly greater than the **median** area
+
+Then compute `counts`: a `Series` of label counts, and `stats`: a `DataFrame` indexed by
+label with columns `count` and `mean_area` (mean rounded to 1 decimal).
+
+No `.apply(axis=1)`, no loops over rows.
+
+#%% code
+df = df_raw.copy()
+
+# TODO: add class_id, area, aspect, is_large
+# TODO: counts = ...
+# TODO: stats = ...  (index: label, columns: count, mean_area)
+
+assert {'class_id', 'area', 'aspect', 'is_large'} <= set(df.columns), 'missing columns'
+assert df['class_id'].tolist() == [CLASSES.index(l) for l in df['label']], 'class_id mapping wrong'
+assert (df['area'] == df['width'] * df['height']).all(), 'area wrong'
+assert df['aspect'].dtype.kind == 'f', 'aspect must be float'
+assert df['is_large'].dtype == bool, 'is_large must be boolean dtype'
+assert df['is_large'].sum() == (df['area'] > df['area'].median()).sum(), 'is_large threshold wrong'
+assert counts.sum() == len(df) and counts.loc['circle'] == 40, 'counts wrong'
+assert list(stats.columns) == ['count', 'mean_area'], f'stats columns: {list(stats.columns)}'
+assert stats.loc['triangle', 'count'] == 15, 'stats count wrong'
+print('PASS')
+display(stats)
+
+#%% md
+---
+## Task 7 - Stratified split, and prove it
+
+Write `stratified_split(frame, label_col, val_frac, seed)` that adds a `split` column with
+values `train`/`val`, where **each class** contributes the same fraction to `val`.
+
+The assertion checks that every class's validation share is within 5 percentage points of
+`val_frac` - which a naive global shuffle will fail for the rare class often enough to
+matter.
+
+#%% code
+def stratified_split(frame, label_col='label', val_frac=0.2, seed=0):
+    """Return a copy of `frame` with a 'split' column of 'train'/'val'."""
+    # TODO: your code here
+    raise NotImplementedError
+
+
+split_df = stratified_split(df, val_frac=0.2, seed=0)
+
+assert 'split' in split_df.columns
+assert set(split_df['split'].unique()) == {'train', 'val'}
+assert len(split_df) == len(df), 'do not drop rows'
+share = split_df.groupby('label')['split'].apply(lambda s: (s == 'val').mean())
+assert (abs(share - 0.2) < 0.05).all(), f'per-class val share off target:\n{share}'
+assert split_df.loc[split_df.split == 'val', 'label'].nunique() == 3, 'every class must appear in val'
+print('PASS  per-class val share:', share.round(3).to_dict())
+print('overall val fraction:', round((split_df.split == 'val').mean(), 3))
+
+#%% md
+---
+## Task 8 (stretch) - Manifest to batch, and a sanity plot
+
+Write `load_batch(frame, size)` that reads the images named in `frame['path']`, resizes to
+`size x size`, and returns:
+
+- `X`: `(N, 1, size, size)` `float32` in 0-1
+- `y`: `(N,)` `int64` class ids
+
+Then plot 8 of them with their labels as titles. If the titles don't match the pictures,
+your indexing is off - which is exactly the bug this plot exists to catch.
+
+#%% code
+def load_batch(frame, size=32):
+    """-> X (N, 1, size, size) float32 in 0..1, y (N,) int64."""
+    # TODO: your code here
+    raise NotImplementedError
+
+
+X, y = load_batch(split_df[split_df.split == 'train'], size=32)
+
+assert X.ndim == 4 and X.shape[1] == 1 and X.shape[2:] == (32, 32), f'bad X shape {X.shape}'
+assert X.dtype == np.float32 and 0.0 <= X.min() and X.max() <= 1.0, 'X must be float32 in 0..1'
+assert y.dtype == np.int64 and y.shape == (X.shape[0],), 'bad y'
+assert set(np.unique(y)) == {0, 1, 2}, 'all three classes should be present'
+print('PASS  X', X.shape, '| y', y.shape, '| channel mean', X.mean(axis=(0, 2, 3)).round(4))
+
+fig, axes = plt.subplots(1, 8, figsize=(13, 2))
+for ax, i in zip(axes, np.random.default_rng(2).permutation(len(X))[:8]):
+    ax.imshow(X[i, 0]); ax.set_title(CLASSES[y[i]], fontsize=9); ax.axis('off')
+plt.tight_layout()
+
+#%% md
+---
+## Done
+
+Self-check before chapter 2:
+
+- [ ] I can convert HWC uint8 to normalized CHW float32 from memory.
+- [ ] I know which indexing forms give views and why that matters in a data pipeline.
+- [ ] I can say what `x.mean(axis=(0, 2, 3))` returns for `x` of shape `(N, C, H, W)`.
+- [ ] I check `value_counts()` and stratify my splits by reflex.
+
+Compare with [`solutions/sol01_numpy_pandas.ipynb`](solutions/sol01_numpy_pandas.ipynb) -
+the solutions explain the *why*, including a couple of alternatives that also pass.

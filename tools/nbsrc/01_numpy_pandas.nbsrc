@@ -1,0 +1,625 @@
+#out notebooks/01_numpy_pandas.ipynb
+#gpu off
+
+#%% md
+# Chapter 1 - NumPy & pandas for image data
+
+Companion to [`docs/01_numpy_pandas.md`](../docs/01_numpy_pandas.md). **No GPU needed.**
+
+By the end of this notebook you will be able to:
+
+1. Read a shape like `(32, 3, 224, 224)` and say what every axis means.
+2. Convert between HWC and CHW without scrambling the image (and *see* what scrambling looks like).
+3. Broadcast per-channel statistics over a batch without guessing at `reshape`.
+4. Use boolean masks to threshold, count, and overlay.
+5. Build an image manifest `DataFrame` and split it in a stratified way.
+
+Run every cell in order. Cells marked **Try this** are where the learning actually happens - change a number, re-run, predict the output *before* you look.
+
+#%% code
+import sys, platform, time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+print('python    ', sys.version.split()[0], platform.system())
+print('numpy     ', np.__version__)
+print('pandas    ', pd.__version__)
+
+try:
+    import google.colab  # noqa: F401
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+print('in colab  ', IN_COLAB)
+
+plt.rcParams['figure.dpi'] = 110
+plt.rcParams['image.cmap'] = 'gray'
+rng = np.random.default_rng(0)
+
+#%% md
+## 1. Make an image from scratch
+
+No downloads: we draw our own data with PIL so this notebook runs anywhere. A colour
+gradient plus some shapes is enough to reason about every array operation we need.
+
+#%% code
+from PIL import Image, ImageDraw
+
+H, W = 128, 160
+
+def make_gradient_rgb(h=H, w=W):
+    """A deterministic RGB test image: R ramps across x, G ramps down y, B is a diagonal."""
+    ys, xs = np.mgrid[0:h, 0:w]          # two (h, w) index grids
+    r = (255 * xs / (w - 1)).astype(np.uint8)
+    g = (255 * ys / (h - 1)).astype(np.uint8)
+    b = (255 * ((xs / (w - 1) + ys / (h - 1)) / 2)).astype(np.uint8)
+    return np.stack([r, g, b], axis=-1)  # axis=-1 -> HWC
+
+img = make_gradient_rgb()
+
+print('shape   ', img.shape, '  <- (H, W, C): rows, cols, channels')
+print('dtype   ', img.dtype)
+print('min/max ', img.min(), img.max())
+print('size    ', img.size, 'values =', img.nbytes / 1024, 'KiB')
+print('ndim    ', img.ndim)
+
+fig, axes = plt.subplots(1, 4, figsize=(11, 2.6))
+axes[0].imshow(img);              axes[0].set_title('RGB (H,W,3)')
+axes[1].imshow(img[..., 0]);      axes[1].set_title('R channel (H,W)')
+axes[2].imshow(img[..., 1]);      axes[2].set_title('G channel')
+axes[3].imshow(img[..., 2]);      axes[3].set_title('B channel')
+for ax in axes: ax.axis('off')
+plt.tight_layout()
+
+#%% md
+### Indexing recap
+
+`img[row, col, channel]`, and **row comes first**. This trips up everyone who thinks in
+`(x, y)`: image arrays are indexed `(y, x)`.
+
+#%% code
+print('top-left pixel      ', img[0, 0])          # 3 values: R, G, B
+print('bottom-right pixel  ', img[-1, -1])
+print('pixel at y=10, x=50 ', img[10, 50])
+print('red at that pixel   ', img[10, 50, 0])
+
+print('\nfirst 3 rows shape        ', img[:3].shape)
+print('a 20x30 crop shape        ', img[40:60, 50:80].shape)
+print('every 4th pixel (subsample)', img[::4, ::4].shape)
+print('flip vertically           ', img[::-1].shape, '(same shape, reversed rows)')
+
+fig, axes = plt.subplots(1, 4, figsize=(11, 2.6))
+axes[0].imshow(img[40:100, 50:130]); axes[0].set_title('crop [40:100, 50:130]')
+axes[1].imshow(img[::4, ::4]);       axes[1].set_title('subsample ::4')
+axes[2].imshow(img[::-1]);           axes[2].set_title('flip y  [::-1]')
+axes[3].imshow(img[:, ::-1]);        axes[3].set_title('flip x  [:, ::-1]')
+for ax in axes: ax.axis('off')
+plt.tight_layout()
+
+#%% md
+## 2. dtype is not a detail
+
+`uint8` holds 0-255 and **wraps silently** on overflow. This is the single most common
+cause of "why does my brightened image have black blotches".
+
+#%% code
+a = np.array([200, 100, 50], dtype=np.uint8)
+print('uint8 200+100 =', a + 100, '  <- 300 wrapped to 44!')
+
+f = a.astype(np.float32) + 100
+print('float32       =', f, '-> clip -> ', np.clip(f, 0, 255).astype(np.uint8))
+
+bright_wrong = img + np.uint8(100)
+bright_right = np.clip(img.astype(np.float32) + 100, 0, 255).astype(np.uint8)
+
+fig, axes = plt.subplots(1, 3, figsize=(9, 2.6))
+axes[0].imshow(img);          axes[0].set_title('original')
+axes[1].imshow(bright_wrong); axes[1].set_title('uint8 + 100 (WRONG)')
+axes[2].imshow(bright_right); axes[2].set_title('float, +100, clip (right)')
+for ax in axes: ax.axis('off')
+plt.tight_layout()
+
+#%% code
+img_f = img.astype(np.float32) / 255.0
+print('float image: dtype', img_f.dtype, 'range', (round(float(img_f.min()), 3), round(float(img_f.max()), 3)))
+print('memory float32', img_f.nbytes // 1024, 'KiB vs uint8', img.nbytes // 1024, 'KiB (4x)')
+print('float64 would be', img.astype(np.float64).nbytes // 1024, 'KiB - never do this for images')
+
+labels = np.array([0, 1, 2, 1], dtype=np.int64)
+print('\nclass labels dtype must be int64 for CrossEntropyLoss:', labels.dtype)
+
+#%% md
+## 3. Views vs copies - the silent corruption bug
+
+Basic slicing gives you a **view**: the same memory, seen differently. Writing to a view
+writes to the original. Fancy indexing (boolean or integer arrays) gives you a **copy**.
+
+#%% code
+base = np.zeros((6, 6), dtype=np.float32)
+
+patch = base[1:4, 1:4]        # basic slice -> VIEW
+patch[:] = 1.0                # writes straight into `base`
+print('after writing to the view:\n', base.astype(int))
+print('is a view? patch.base is base ->', patch.base is base)
+print('shares memory              ->', np.shares_memory(base, patch))
+
+base2 = np.zeros((6, 6), dtype=np.float32)
+patch2 = base2[1:4, 1:4].copy()   # explicit copy
+patch2[:] = 1.0
+print('\nwith .copy(), base2 untouched. sum =', base2.sum())
+
+print('\nfancy indexing always copies:')
+print('  boolean  ', np.shares_memory(base, base[base > 0]))
+print('  int array', np.shares_memory(base, base[[0, 2]]))
+print('  slice    ', np.shares_memory(base, base[0:2]))
+
+#%% code
+def brighten_bad(image, amount=0.2):
+    """Mutates the caller's array. A landmine in a data pipeline."""
+    image += amount
+    return image
+
+def brighten_good(image, amount=0.2):
+    """Returns a new array. Boring, correct."""
+    return image + amount
+
+original = np.full((2, 2), 0.5, dtype=np.float32)
+_ = brighten_bad(original)
+print('after brighten_bad, the ORIGINAL changed:', original.ravel())
+
+original = np.full((2, 2), 0.5, dtype=np.float32)
+_ = brighten_good(original)
+print('after brighten_good, original intact:    ', original.ravel())
+
+#%% md
+**Try this:** in `brighten_bad`, change `image += amount` to `image = image + amount`.
+Re-run. Why is the original now safe? (`+=` is in-place on the buffer; `=` rebinds a local name.)
+
+## 4. Broadcasting
+
+Shapes align **from the right**. Each dimension pair must be equal, or one of them 1.
+
+```
+HWC:  (128, 160, 3)  and  (3,)      -> (3,) becomes (1,1,3) -> works
+CHW:  (3, 128, 160)  and  (3,)      -> tries 3 vs 160       -> ERROR
+CHW:  (3, 128, 160)  and  (3, 1, 1) -> works
+```
+
+#%% code
+mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)   # the ImageNet stats
+std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+hwc = img_f                                # (H, W, 3)
+norm_hwc = (hwc - mean) / std              # (3,) broadcasts over the last axis
+print('HWC normalize ok:', norm_hwc.shape)
+
+chw = np.transpose(img_f, (2, 0, 1))       # (3, H, W)
+try:
+    _ = (chw - mean) / std
+except ValueError as e:
+    print('\nCHW with (3,) fails, as expected:\n  ', e)
+
+norm_chw = (chw - mean[:, None, None]) / std[:, None, None]
+print('\nCHW normalize ok:', norm_chw.shape, '  mean per channel:', norm_chw.mean(axis=(1, 2)).round(3))
+print('mean[:, None, None].shape =', mean[:, None, None].shape, '(None == np.newaxis)')
+
+#%% code
+batch = np.stack([make_gradient_rgb() for _ in range(4)])          # (4, H, W, 3)
+batch_chw = np.transpose(batch, (0, 3, 1, 2)).astype(np.float32) / 255.0
+
+print('NHWC', batch.shape, '-> NCHW', batch_chw.shape)
+
+per_channel = mean.reshape(1, 3, 1, 1)      # (1,3,1,1) broadcasts over N, H, W
+print('normalized batch:', ((batch_chw - per_channel)).shape)
+
+print('\nbroadcast compatibility table:')
+for a_shape, b_shape in [((4, 3, 8, 8), (3, 1, 1)), ((4, 3, 8, 8), (1, 3, 1, 1)),
+                         ((4, 3, 8, 8), (8, 8)), ((4, 3, 8, 8), (3,)),
+                         ((4, 3, 8, 8), (4, 1, 1, 1))]:
+    try:
+        out = np.broadcast_shapes(a_shape, b_shape)
+        print(f'  {str(a_shape):18} + {str(b_shape):14} -> {out}')
+    except ValueError:
+        print(f'  {str(a_shape):18} + {str(b_shape):14} -> INCOMPATIBLE')
+
+#%% md
+## 5. Axes and reductions
+
+The rule: **`axis` is the axis that disappears.** `keepdims=True` leaves it as length 1 so
+the result stays broadcastable against the input.
+
+#%% code
+x = rng.random((32, 3, 64, 64), dtype=np.float32)     # a fake NCHW batch
+print('input', x.shape, '\n')
+
+for expr, val in [
+    ("x.mean()",                      x.mean().shape),
+    ("x.mean(axis=0)",                x.mean(axis=0).shape),
+    ("x.mean(axis=1)",                x.mean(axis=1).shape),
+    ("x.mean(axis=(2, 3))",           x.mean(axis=(2, 3)).shape),
+    ("x.mean(axis=(0, 2, 3))",        x.mean(axis=(0, 2, 3)).shape),
+    ("x.sum(axis=1, keepdims=True)",  x.sum(axis=1, keepdims=True).shape),
+]:
+    print(f'  {expr:32} -> {val}')
+
+print('\ndataset per-channel mean/std (what you feed Normalize):')
+print('  mean', x.mean(axis=(0, 2, 3)).round(4), '\n  std ', x.std(axis=(0, 2, 3)).round(4))
+print('\nglobal average pooling  x.mean(axis=(2,3)):', x.mean(axis=(2, 3)).shape, '<- (N, C) feature vector')
+
+#%% code
+logits = rng.normal(size=(5, 10)).astype(np.float32)
+
+probs = np.exp(logits) / np.exp(logits).sum(axis=1, keepdims=True)   # softmax
+print('probs rows sum to 1:', probs.sum(axis=1).round(6))
+print('predicted classes   :', logits.argmax(axis=1), '<- (N,) from (N, C)')
+print('confidence          :', probs.max(axis=1).round(3))
+
+seg_logits = rng.normal(size=(2, 5, 8, 8)).astype(np.float32)
+seg_pred = seg_logits.argmax(axis=1)
+print('\nsegmentation: (N,C,H,W)', seg_logits.shape, '-> argmax(axis=1) ->', seg_pred.shape)
+print('same operation, one more spatial rank. This is the whole trick.')
+
+#%% md
+**Numerical note:** the naive softmax above overflows for large logits. The stable form
+subtracts the max first: `e = np.exp(logits - logits.max(axis=1, keepdims=True))`. Try it
+with `logits = np.array([[1000., 1001.]])` and watch the naive version produce `nan`.
+
+## 6. reshape vs transpose - let's *see* the difference
+
+`reshape` reinterprets the memory in order. `transpose` reorders the axes. Using `reshape`
+to go HWC -> CHW is the classic mistake, and the result is unmistakable.
+
+#%% code
+small = make_gradient_rgb(64, 64)
+small_f = small.astype(np.float32) / 255.0
+
+wrong = small_f.reshape(3, 64, 64)              # WRONG: scrambles pixels
+right = np.transpose(small_f, (2, 0, 1))        # RIGHT
+
+back_wrong = np.transpose(wrong, (1, 2, 0))
+back_right = np.transpose(right, (1, 2, 0))
+
+fig, axes = plt.subplots(1, 3, figsize=(9, 3))
+axes[0].imshow(small_f);     axes[0].set_title('original HWC')
+axes[1].imshow(back_wrong);  axes[1].set_title('via reshape(3,H,W)\nSCRAMBLED')
+axes[2].imshow(back_right);  axes[2].set_title('via transpose(2,0,1)\ncorrect')
+for ax in axes: ax.axis('off')
+plt.tight_layout()
+
+print('both have shape', wrong.shape, '- shape agreement proves nothing!')
+print('identical?', np.array_equal(wrong, right))
+print('\nis the transposed array contiguous?', right.flags['C_CONTIGUOUS'],
+      '-> np.ascontiguousarray() if a library complains')
+
+#%% code
+print('flatten for a linear layer:')
+print('  single image ', small_f.reshape(-1).shape, '= 64*64*3')
+print('  keep batch   ', batch_chw.reshape(batch_chw.shape[0], -1).shape, '<- what nn.Flatten() does')
+
+print('\nadd / remove axes:')
+print('  img[None]           ', small_f[None].shape, '(unsqueeze(0): batch of 1)')
+print('  img[None].squeeze() ', small_f[None].squeeze().shape)
+print('  gray[..., None]     ', small_f.mean(-1)[..., None].shape, '(H,W) -> (H,W,1)')
+
+print('\nstack vs concatenate:')
+imgs = [make_gradient_rgb(16, 16) for _ in range(3)]
+print('  np.stack       ', np.stack(imgs).shape, '(new axis: 3 images -> batch)')
+print('  np.concatenate ', np.concatenate(imgs, axis=0).shape, '(no new axis: 3 images stacked as rows)')
+
+print('\npadding (needed before convolution):')
+g = small_f.mean(-1)
+print('  zero  ', np.pad(g, ((2, 2), (2, 2))).shape)
+print('  reflect', np.pad(g, ((2, 2), (2, 2)), mode='reflect').shape)
+
+#%% md
+## 7. Masks: threshold, count, overlay
+
+A boolean array is a mask. `True` counts as 1, so `.sum()` is a pixel count and `.mean()`
+is a coverage fraction.
+
+#%% code
+def draw_shapes(h=128, w=160, seed=0):
+    """Grayscale canvas with a circle, a square and a triangle. Returns (image, label_mask)."""
+    im = Image.new('L', (w, h), color=20)
+    d = ImageDraw.Draw(im)
+    mask = Image.new('L', (w, h), color=0)      # 0=background 1=circle 2=square 3=triangle
+    dm = ImageDraw.Draw(mask)
+    d.ellipse([10, 20, 60, 70], fill=200);        dm.ellipse([10, 20, 60, 70], fill=1)
+    d.rectangle([80, 15, 140, 60], fill=140);     dm.rectangle([80, 15, 140, 60], fill=2)
+    d.polygon([(40, 120), (10, 85), (70, 85)], fill=90)
+    dm.polygon([(40, 120), (10, 85), (70, 85)], fill=3)
+    return np.asarray(im), np.asarray(mask)
+
+gray, label_mask = draw_shapes()
+gray_f = gray.astype(np.float32) / 255.0
+
+bright = gray_f > 0.5
+print('bright pixels     ', bright.sum(), 'of', bright.size)
+print('coverage fraction ', round(float(bright.mean()), 4))
+
+ids, counts = np.unique(label_mask, return_counts=True)
+names = {0: 'background', 1: 'circle', 2: 'square', 3: 'triangle'}
+print('\nclass balance in the mask:')
+for i, c in zip(ids, counts):
+    print(f'  {i} {names[int(i)]:11} {c:6d} px  {100 * c / label_mask.size:5.1f}%')
+print('\nBackground dominates. Remember this when you pick a segmentation metric.')
+
+#%% code
+overlay = np.stack([gray_f] * 3, axis=-1)          # gray -> RGB so we can paint colour
+palette = {1: (1.0, 0.2, 0.2), 2: (0.2, 1.0, 0.3), 3: (0.3, 0.5, 1.0)}
+for cls, colour in palette.items():
+    sel = label_mask == cls                       # (H, W) bool
+    overlay[sel] = 0.5 * overlay[sel] + 0.5 * np.array(colour, dtype=np.float32)
+
+fig, axes = plt.subplots(1, 4, figsize=(12, 2.8))
+axes[0].imshow(gray_f);                       axes[0].set_title('image')
+axes[1].imshow(bright);                       axes[1].set_title('mask: gray > 0.5')
+axes[2].imshow(label_mask, cmap='viridis');   axes[2].set_title('label mask (0-3)')
+axes[3].imshow(overlay);                      axes[3].set_title('overlay')
+for ax in axes: ax.axis('off')
+plt.tight_layout()
+
+print('np.where picks between two options elementwise:')
+binary_u8 = np.where(bright, 255, 0).astype(np.uint8)
+print('  ', binary_u8.dtype, np.unique(binary_u8))
+
+#%% md
+**Try this:** compute the bounding box of the circle from `label_mask` alone.
+Hint: `ys, xs = np.nonzero(label_mask == 1)`, then min/max each.
+
+## 8. Vectorization: how much does the loop actually cost?
+
+#%% code
+test = rng.random((256, 256), dtype=np.float32)
+
+t0 = time.perf_counter()
+out_loop = np.empty_like(test)
+for i in range(test.shape[0]):
+    for j in range(test.shape[1]):
+        out_loop[i, j] = test[i, j] * 1.2 + 0.05
+t_loop = time.perf_counter() - t0
+
+t0 = time.perf_counter()
+out_vec = test * 1.2 + 0.05
+t_vec = time.perf_counter() - t0
+
+print(f'python loop  {t_loop * 1000:8.2f} ms')
+print(f'vectorized   {t_vec * 1000:8.2f} ms')
+print(f'speedup      {t_loop / max(t_vec, 1e-9):8.0f}x')
+print('same result  ', np.allclose(out_loop, out_vec))
+
+#%% code
+a = rng.random((8, 16), dtype=np.float32)
+b = rng.random((8, 16), dtype=np.float32)
+
+print('per-sample dot product, three ways:')
+print('  loop     ', np.array([a[i] @ b[i] for i in range(8)]).round(3))
+print('  broadcast', (a * b).sum(axis=1).round(3))
+print('  einsum   ', np.einsum('nc,nc->n', a, b).round(3))
+
+M, N = rng.random((4, 5)), rng.random((5, 3))
+print('\nmatmul: M @ N', (M @ N).shape, '== einsum', np.einsum('ij,jk->ik', M, N).shape)
+
+#%% md
+## 9. Reproducible randomness
+
+Use `np.random.default_rng(seed)`. The legacy global `np.random.seed()` is shared mutable
+state - two libraries reseeding it is a debugging nightmare.
+
+#%% code
+r1 = np.random.default_rng(42)
+r2 = np.random.default_rng(42)
+print('two generators, same seed -> identical:', np.array_equal(r1.random(5), r2.random(5)))
+
+r = np.random.default_rng(7)
+print('\nuniform  ', r.random(3).round(3))
+print('normal   ', r.normal(0, 1, 3).round(3))
+print('integers ', r.integers(0, 256, 5))
+print('choice   ', r.choice(['cat', 'dog', 'bird'], 5))
+print('permute  ', r.permutation(8), '<- shuffled indices for a split')
+
+noisy = np.clip(gray_f + r.normal(0, 0.08, gray_f.shape), 0, 1)
+fig, axes = plt.subplots(1, 2, figsize=(6, 2.6))
+axes[0].imshow(gray_f); axes[0].set_title('clean')
+axes[1].imshow(noisy);  axes[1].set_title('+ gaussian noise (augmentation)')
+for ax in axes: ax.axis('off')
+plt.tight_layout()
+
+#%% md
+## 10. pandas: build a real image manifest
+
+Now the other half of the job. We will write an actual little dataset to disk, then build
+the table that a `torch.utils.data.Dataset` would read. This is exactly the workflow you
+use on real data.
+
+#%% code
+DATA = Path('data/shapes')
+CLASSES = ['circle', 'square', 'triangle']
+
+def draw_one(kind, size, rng):
+    """One 32x32 grayscale example of `kind`, with random position/size/brightness."""
+    im = Image.new('L', (size, size), color=int(rng.integers(10, 40)))
+    d = ImageDraw.Draw(im)
+    fill = int(rng.integers(120, 255))
+    pad = int(rng.integers(2, 6))
+    x0, y0 = int(rng.integers(0, pad + 3)), int(rng.integers(0, pad + 3))
+    x1, y1 = size - 1 - int(rng.integers(0, pad + 3)), size - 1 - int(rng.integers(0, pad + 3))
+    if kind == 'circle':
+        d.ellipse([x0, y0, x1, y1], fill=fill)
+    elif kind == 'square':
+        d.rectangle([x0, y0, x1, y1], fill=fill)
+    else:
+        d.polygon([(x0, y1), ((x0 + x1) // 2, y0), (x1, y1)], fill=fill)
+    return im
+
+def build_dataset(n_per_class=(40, 25, 15), seed=0):
+    """Deliberately imbalanced, so `value_counts()` has something to tell us."""
+    r = np.random.default_rng(seed)
+    rows = []
+    for kind, n in zip(CLASSES, n_per_class):
+        outdir = DATA / kind
+        outdir.mkdir(parents=True, exist_ok=True)
+        for i in range(n):
+            size = int(r.choice([28, 32, 40]))
+            im = draw_one(kind, size, r)
+            p = outdir / f'{kind}_{i:03d}.png'
+            im.save(p)
+            rows.append({'path': p.as_posix(), 'label': kind, 'width': im.width, 'height': im.height})
+    return rows
+
+rows = build_dataset()
+print(f'wrote {len(rows)} images under {DATA.resolve()}')
+
+#%% code
+df = pd.DataFrame(rows)
+
+print('shape', df.shape)
+print('\ndtypes\n', df.dtypes)
+print('\nhead()')
+display(df.head())
+print('a Series (one column):', type(df['label']).__name__)
+print('a DataFrame (list of columns):', type(df[['path', 'label']]).__name__)
+
+#%% code
+print('label counts - ALWAYS look at this before training')
+print(df['label'].value_counts())
+print('\nas fractions')
+print((df['label'].value_counts(normalize=True) * 100).round(1))
+
+df['area'] = df['width'] * df['height']              # vectorized, no loop
+df['class_id'] = df['label'].map({c: i for i, c in enumerate(CLASSES)})
+
+print('\ngroupby aggregate')
+display(df.groupby('label')['area'].agg(['count', 'mean', 'min', 'max']))
+
+print('missing values per column:\n', df.isna().sum().to_dict())
+
+#%% code
+print('loc = labels, iloc = integer positions')
+print('  df.loc[0, "label"] ->', df.loc[0, 'label'])
+print('  df.iloc[0, 1]      ->', df.iloc[0, 1])
+
+print('\nboolean filtering')
+big = df[(df.area > 1024) & (df.label == 'circle')]
+print('  big circles:', len(big))
+print('  same via query:', len(df.query('area > 1024 and label == "circle"')))
+
+print('\nsorting')
+display(df.sort_values('area', ascending=False).head(3)[['path', 'label', 'area']])
+
+print('SettingWithCopyWarning avoidance:')
+print('  WRONG: df[df.area > 1024]["flag"] = 1   (writes to a temporary)')
+df.loc[df.area > 1024, 'is_big'] = True
+df['is_big'] = df['is_big'].fillna(False)
+print('  RIGHT: df.loc[mask, "flag"] = 1  ->  is_big counts:', df['is_big'].sum())
+
+#%% md
+### Stratified split
+
+A plain random split can hand you a validation set containing zero triangles (we only
+made 15 of them). Split *within* each class instead.
+
+#%% code
+def stratified_split(frame, label_col='label', val_frac=0.2, seed=0):
+    r = np.random.default_rng(seed)
+    out = frame.copy()
+    out['split'] = 'train'
+    for _, idx in out.groupby(label_col).groups.items():
+        idx = np.array(idx)
+        r.shuffle(idx)
+        n_val = int(round(val_frac * len(idx)))
+        out.loc[idx[:n_val], 'split'] = 'val'
+    return out
+
+df = stratified_split(df, val_frac=0.25, seed=0)
+
+print('rows per split:', df['split'].value_counts().to_dict())
+print('\nclass proportions preserved in both splits:')
+display(pd.crosstab(df['split'], df['label'], normalize='index').round(3))
+
+naive = df.copy()
+naive_idx = np.random.default_rng(3).permutation(len(naive))
+naive['split_naive'] = 'train'
+naive.loc[naive_idx[:int(0.25 * len(naive))], 'split_naive'] = 'val'
+print('a naive random split, for comparison:')
+display(pd.crosstab(naive['split_naive'], naive['label']))
+
+#%% code
+manifest_path = Path('data/manifest.csv')
+df.to_csv(manifest_path, index=False)
+print('saved', manifest_path, '- this file is what a Dataset would read')
+
+reloaded = pd.read_csv(manifest_path)
+print('reloaded', reloaded.shape, '| columns:', list(reloaded.columns))
+print('\nmerge example: attach per-class weights (for imbalanced loss later)')
+weights = (1.0 / df['label'].value_counts(normalize=True)).rename('class_weight').reset_index()
+weights.columns = ['label', 'class_weight']
+merged = df.merge(weights, on='label', how='left')
+display(merged[['path', 'label', 'class_weight']].drop_duplicates('label'))
+
+#%% md
+## 11. Manifest -> batch: closing the loop
+
+Read the paths from the table, load the pixels, build an NCHW `float32` batch, and compute
+the dataset statistics you would hand to `transforms.Normalize`. This is what a
+`DataLoader` does for you in chapter 4 - do it by hand once.
+
+#%% code
+train_df = df[df.split == 'train'].reset_index(drop=True)
+
+def load_batch(frame, size=32, limit=None):
+    """Read images listed in `frame` into an (N, 1, size, size) float32 batch."""
+    sub = frame if limit is None else frame.iloc[:limit]
+    arrs = []
+    for p in sub['path']:
+        im = Image.open(p).convert('L').resize((size, size), Image.BILINEAR)
+        arrs.append(np.asarray(im, dtype=np.float32) / 255.0)
+    x = np.stack(arrs)                 # (N, H, W)
+    x = x[:, None, :, :]               # (N, 1, H, W)  <- add the channel axis
+    y = sub['class_id'].to_numpy(dtype=np.int64)
+    return x, y
+
+X, y = load_batch(train_df)
+print('X', X.shape, X.dtype, '| y', y.shape, y.dtype)
+print('per-channel mean', X.mean(axis=(0, 2, 3)).round(4), 'std', X.std(axis=(0, 2, 3)).round(4))
+print('bytes', X.nbytes / 1024, 'KiB')
+
+fig, axes = plt.subplots(2, 6, figsize=(11, 4))
+for ax, i in zip(axes.ravel(), np.random.default_rng(1).permutation(len(X))[:12]):
+    ax.imshow(X[i, 0])
+    ax.set_title(CLASSES[y[i]], fontsize=9)
+    ax.axis('off')
+plt.suptitle('a batch, decoded from the manifest')
+plt.tight_layout()
+
+#%% code
+print('the shape story of this chapter, end to end:')
+print('  one PNG on disk            ->  (32, 32)      uint8   0..255')
+print('  /255 and to float          ->  (32, 32)      float32 0..1')
+print('  add channel axis  [None]   ->  (1, 32, 32)   float32   CHW')
+print('  np.stack N of them         ->  (N, 1, 32, 32)          NCHW')
+print('  normalize (x-mean)/std     ->  same shape, mean~0 std~1')
+print('  flatten for a linear layer ->  (N, 1024)')
+print('\nEverything after this chapter is this pipeline with more interesting operations in the middle.')
+
+#%% md
+## What to remember
+
+| Idea | The one-liner |
+|---|---|
+| PyTorch image layout | `(N, C, H, W)`, `float32`, normalized |
+| HWC <-> CHW | `np.transpose(img, (2,0,1))` - **never** `reshape` |
+| Broadcasting | align from the right; `mean[:, None, None]` for CHW |
+| `axis=k` | the axis that disappears; `keepdims=True` to keep it broadcastable |
+| Predictions | `logits.argmax(axis=1)` for both `(N,C)` and `(N,C,H,W)` |
+| Views | basic slicing = view (mutable!), fancy indexing = copy |
+| dtype | images `float32`, labels `int64`, arithmetic never on `uint8` |
+| Class balance | `df['label'].value_counts()` before you train, every time |
+| Splits | stratify; a naive split can drop a rare class entirely |
+| Randomness | `rng = np.random.default_rng(seed)`, passed explicitly |
+
+Now do [`exercises/ex01_numpy_pandas.ipynb`](../exercises/ex01_numpy_pandas.ipynb),
+then move to chapter 2 where these arrays become a model that learns.

@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Datasets and training artifacts - never commit these
+data/
+runs/
+checkpoints/
+*.pt
+*.pth
+*.onnx
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

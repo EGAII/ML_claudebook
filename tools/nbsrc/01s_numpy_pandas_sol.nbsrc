@@ -1,0 +1,495 @@
+#out exercises/solutions/sol01_numpy_pandas.ipynb
+#gpu off
+
+#%% md
+# Solutions 1 - NumPy & pandas for image data
+
+Same tasks as [`ex01_numpy_pandas.ipynb`](../ex01_numpy_pandas.ipynb), with the reasoning
+spelled out. Where more than one answer is idiomatic I show both, because reading the
+alternatives is how you build taste.
+
+#%% code
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from PIL import Image, ImageDraw
+
+plt.rcParams['figure.dpi'] = 110
+plt.rcParams['image.cmap'] = 'gray'
+rng = np.random.default_rng(0)
+
+DATA = Path('data/shapes')
+CLASSES = ['circle', 'square', 'triangle']
+
+def draw_one(kind, size, r):
+    im = Image.new('L', (size, size), color=int(r.integers(10, 40)))
+    d = ImageDraw.Draw(im)
+    fill = int(r.integers(120, 255))
+    pad = int(r.integers(2, 6))
+    x0, y0 = int(r.integers(0, pad + 3)), int(r.integers(0, pad + 3))
+    x1, y1 = size - 1 - int(r.integers(0, pad + 3)), size - 1 - int(r.integers(0, pad + 3))
+    if kind == 'circle':
+        d.ellipse([x0, y0, x1, y1], fill=fill)
+    elif kind == 'square':
+        d.rectangle([x0, y0, x1, y1], fill=fill)
+    else:
+        d.polygon([(x0, y1), ((x0 + x1) // 2, y0), (x1, y1)], fill=fill)
+    return im
+
+def build_dataset(n_per_class=(40, 25, 15), seed=0):
+    r = np.random.default_rng(seed)
+    rows = []
+    for kind, n in zip(CLASSES, n_per_class):
+        (DATA / kind).mkdir(parents=True, exist_ok=True)
+        for i in range(n):
+            im = draw_one(kind, int(r.choice([28, 32, 40])), r)
+            p = DATA / kind / f'{kind}_{i:03d}.png'
+            im.save(p)
+            rows.append({'path': p.as_posix(), 'label': kind, 'width': im.width, 'height': im.height})
+    return pd.DataFrame(rows)
+
+manifest = Path('data/manifest_ex.csv')
+if manifest.exists():
+    df_raw = pd.read_csv(manifest)
+else:
+    df_raw = build_dataset()
+    df_raw.to_csv(manifest, index=False)
+
+def make_gradient_rgb(h=64, w=96):
+    ys, xs = np.mgrid[0:h, 0:w]
+    r = (255 * xs / (w - 1)).astype(np.uint8)
+    g = (255 * ys / (h - 1)).astype(np.uint8)
+    b = (255 * ((xs / (w - 1) + ys / (h - 1)) / 2)).astype(np.uint8)
+    return np.stack([r, g, b], axis=-1)
+
+print('setup ok:', len(df_raw), 'images')
+
+#%% md
+---
+## Task 1 - HWC uint8 to normalized CHW float32
+
+#%% code
+def to_normalized_chw(img, mean, std):
+    x = img.astype(np.float32) / 255.0            # scale FIRST, in float
+    x = np.transpose(x, (2, 0, 1))                # HWC -> CHW (a view, non-contiguous)
+    x = (x - mean[:, None, None]) / std[:, None, None]
+    return np.ascontiguousarray(x, dtype=np.float32)
+
+
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+test_img = make_gradient_rgb(64, 96)
+out = to_normalized_chw(test_img, IMAGENET_MEAN, IMAGENET_STD)
+
+assert out.shape == (3, 64, 96)
+assert out.dtype == np.float32
+assert out.flags['C_CONTIGUOUS']
+expected_r = (test_img[..., 0].astype(np.float32) / 255.0 - IMAGENET_MEAN[0]) / IMAGENET_STD[0]
+assert np.allclose(out[0], expected_r, atol=1e-6)
+print('PASS  ', out.shape, out.mean(axis=(1, 2)).round(3))
+
+#%% md
+### Why this way
+
+**Order matters.** `/255` before normalizing, because `mean`/`std` are expressed in 0-1
+units. Doing it after gives you values ~255x too large and a model that never converges.
+
+**Normalize in HWC or CHW - your choice**, but the broadcast differs:
+
+```python
+(x_hwc - mean) / std                              # (H,W,3) with (3,)   -> fine
+(x_chw - mean[:, None, None]) / std[:, None, None] # (3,H,W) with (3,1,1) -> fine
+```
+
+Normalizing *before* the transpose is slightly cleaner:
+
+```python
+x = (img.astype(np.float32) / 255.0 - mean) / std     # HWC, plain (3,) broadcast
+return np.ascontiguousarray(np.transpose(x, (2, 0, 1)))
+```
+
+**Why `ascontiguousarray`.** `transpose` returns a *view* with permuted strides; the bytes
+were never moved. Most NumPy code doesn't care, but `torch.from_numpy` on a
+negative/permuted-stride array, `.tobytes()`, and some C extensions do. It's a memcpy -
+cheap insurance.
+
+**Why float32 not float64.** `img.astype(np.float32) / 255.0` stays float32. Had you written
+`img / 255.0`, NumPy would promote to float64: double the memory, and `torch` would then
+complain about a dtype mismatch against its float32 weights.
+
+#%% md
+---
+## Task 2 - Center crop, as a view
+
+#%% code
+def center_crop(img, ch, cw):
+    h, w = img.shape[:2]
+    if ch > h or cw > w:
+        raise ValueError(f'crop {ch}x{cw} does not fit in {h}x{w}')
+    top = (h - ch) // 2
+    left = (w - cw) // 2
+    return img[top:top + ch, left:left + cw]      # basic slicing -> view
+
+
+big = make_gradient_rgb(64, 96)
+crop = center_crop(big, 32, 32)
+
+assert crop.shape == (32, 32, 3)
+assert np.shares_memory(big, crop)
+assert np.array_equal(crop, big[16:48, 32:64])
+assert center_crop(big.mean(-1), 10, 10).shape == (10, 10)
+try:
+    center_crop(big, 100, 100)
+except ValueError as e:
+    print('PASS  ', crop.shape, '| raises:', e)
+
+#%% md
+### Why this way
+
+**`img.shape[:2]` not `h, w, c = img.shape`.** Taking the first two dims makes the function
+work for `(H,W)`, `(H,W,3)` and `(H,W,4)` alike. Unpacking three names breaks on grayscale -
+and grayscale masks are exactly what you'll pass it in chapter 6.
+
+**`(h - ch) // 2` rounds down.** For odd differences you lose the extra row from the bottom.
+That's the same convention as `torchvision.transforms.CenterCrop`, so your hand-written
+preprocessing and torchvision's agree - worth matching deliberately.
+
+**Basic slicing keeps it a view**, so cropping a large batch costs nothing. The trap:
+if the caller then writes into the crop, they're writing into the original. If your
+augmentation pipeline mutates crops, `.copy()` at the point of mutation - not here.
+
+**Raise, don't clamp.** Silently returning a smaller crop than requested produces a batch
+with inconsistent shapes 200 lines later, where the error message will be useless.
+
+#%% md
+---
+## Task 3 - Dataset statistics
+
+#%% code
+def channel_stats(batch):
+    return batch.mean(axis=(0, 2, 3)), batch.std(axis=(0, 2, 3))
+
+
+fake = rng.random((16, 3, 8, 8), dtype=np.float32)
+fake[:, 0] *= 0.5
+m, s = channel_stats(fake)
+
+assert m.shape == (3,) and s.shape == (3,)
+assert np.allclose(m, fake.mean(axis=(0, 2, 3)), atol=1e-6)
+assert np.allclose(s, fake.std(axis=(0, 2, 3)), atol=1e-6)
+assert m[0] < m[1]
+print('PASS  mean', m.round(4), 'std', s.round(4))
+
+#%% md
+### Why axes `(0, 2, 3)`
+
+The layout is `(N, C, H, W)`. We want **one number per channel**, so every axis *except*
+the channel axis must be collapsed: batch (0), height (2), width (3). Axis 1 is the one we
+keep, so it's the one we don't name.
+
+`(0, 1, 2)` would collapse batch, channel and height, leaving a `(W,)` array - a per-column
+statistic, which is meaningless for normalization.
+
+A useful mnemonic: **the axes you list disappear; the axes you don't list are the shape of
+the answer.**
+
+Two footnotes for real datasets:
+
+- Images of different sizes can't be stacked into one array, so you accumulate instead:
+  keep running sums of `x.sum(axis=(0,2,3))`, `(x**2).sum(axis=(0,2,3))` and the pixel count,
+  then `std = sqrt(E[x^2] - E[x]^2)`. One pass, constant memory.
+- Compute stats on the **training split only**. Using the validation set leaks information
+  about data you're pretending not to have seen.
+
+#%% md
+---
+## Task 4 - Mask statistics and bounding boxes
+
+#%% code
+def class_fractions(mask, num_classes):
+    counts = np.bincount(mask.ravel(), minlength=num_classes)
+    return counts[:num_classes].astype(np.float64) / mask.size
+
+
+def bbox(mask, cls):
+    ys, xs = np.nonzero(mask == cls)
+    if ys.size == 0:
+        return None
+    return (int(ys.min()), int(xs.min()), int(ys.max()), int(xs.max()))
+
+
+mask = np.zeros((40, 60), dtype=np.int64)
+mask[5:15, 10:30] = 1
+mask[20:24, 40:50] = 2
+
+fr = class_fractions(mask, num_classes=5)
+assert fr.shape == (5,) and np.isclose(fr.sum(), 1.0)
+assert np.isclose(fr[1], 200 / mask.size) and np.isclose(fr[2], 40 / mask.size)
+assert fr[3] == 0.0 and fr[4] == 0.0
+assert bbox(mask, 1) == (5, 10, 14, 29)
+assert bbox(mask, 2) == (20, 40, 23, 49)
+assert bbox(mask, 3) is None
+print('PASS  fractions', fr.round(4), '| bbox(1)', bbox(mask, 1))
+
+#%% md
+### Why this way
+
+**`np.bincount(..., minlength=num_classes)` beats `np.unique`.** `unique` only returns the
+classes that are *present*, so class 3 would vanish from your array and every downstream
+index would be off by one. `bincount` with `minlength` gives you a dense, aligned vector -
+exactly what you need to compute class weights for a loss function.
+
+The `counts[:num_classes]` slice guards the reverse case: if the mask contains a label
+*larger* than `num_classes-1` (corrupt data), `bincount` returns a longer array. Truncating
+keeps the shape contract; in production you'd rather assert loudly.
+
+**`np.nonzero` returns index arrays, one per dimension.** `ys, xs = np.nonzero(m == cls)`
+is the idiomatic way to get coordinates. Note the order: rows first.
+
+**Inclusive vs exclusive bounds.** I returned inclusive `max()`, which is why the box for
+rows `5:15` ends at 14. Most detection code (and `torchvision`'s boxes) uses exclusive
+`x2`/`y2`, i.e. `max()+1`. Neither is wrong; mixing them within one codebase is, and it
+produces off-by-one boxes that are maddening to spot on a plot.
+
+An alternative that's faster on big masks, because it avoids materialising coordinates:
+
+```python
+rows = np.any(mask == cls, axis=1)
+cols = np.any(mask == cls, axis=0)
+y0, y1 = np.argmax(rows), len(rows) - 1 - np.argmax(rows[::-1])
+```
+
+#%% md
+---
+## Task 5 - Kill the loop
+
+#%% code
+def gamma_slow(img, gamma=2.2):
+    out = np.empty_like(img)
+    for i in range(img.shape[0]):
+        for j in range(img.shape[1]):
+            out[i, j] = min(max(img[i, j], 0.0), 1.0) ** (1.0 / gamma)
+    return out
+
+
+def gamma_fast(img, gamma=2.2):
+    return np.clip(img, 0.0, 1.0) ** (1.0 / gamma)
+
+
+test = rng.random((256, 256), dtype=np.float32)
+t0 = time.perf_counter(); slow = gamma_slow(test); t_slow = time.perf_counter() - t0
+t0 = time.perf_counter(); fast = gamma_fast(test); t_fast = time.perf_counter() - t0
+
+assert np.allclose(slow, fast, atol=1e-6)
+print(f'PASS  slow {t_slow * 1000:7.2f} ms | fast {t_fast * 1000:6.2f} ms | {t_slow / t_fast:5.0f}x')
+
+#%% md
+### Why this way
+
+`np.clip` is the vectorized `min(max(...))`, and `**` broadcasts over the whole array. One
+line, one pass through C.
+
+**Where the 100x+ goes:** the loop version pays, per pixel, for a Python bytecode dispatch,
+two function calls, boxing a `np.float32` into a Python object, and an unboxed store. The
+vectorized version pays once for the dispatch and then runs a tight C loop over contiguous
+memory (often SIMD-vectorized).
+
+**Note the negative-value trap.** Clipping *before* the exponent isn't cosmetic:
+`(-0.1) ** (1/2.2)` is `nan` in floating point, because a fractional power of a negative
+number isn't real. Same call order as the reference, same results - always mirror the
+reference's order of operations when you optimize.
+
+**When you genuinely can't vectorize** (per-pixel branching, irregular access): use a
+lookup table for uint8 input - there are only 256 possible values, so build a
+`(256,)` table once and index with `table[img]`. That's the classic trick real image
+libraries use for gamma and contrast curves:
+
+```python
+table = (np.clip(np.arange(256) / 255.0, 0, 1) ** (1 / 2.2) * 255).astype(np.uint8)
+out = table[img_uint8]     # a gather, not a loop
+```
+
+#%% md
+---
+## Task 6 - Manifest bookkeeping with pandas
+
+#%% code
+df = df_raw.copy()
+
+df['class_id'] = df['label'].map({c: i for i, c in enumerate(CLASSES)})
+df['area'] = df['width'] * df['height']
+df['aspect'] = df['width'] / df['height']
+df['is_large'] = df['area'] > df['area'].median()
+
+counts = df['label'].value_counts()
+
+stats = (df.groupby('label')
+           .agg(count=('path', 'size'), mean_area=('area', 'mean'))
+           .round({'mean_area': 1}))
+
+assert {'class_id', 'area', 'aspect', 'is_large'} <= set(df.columns)
+assert df['class_id'].tolist() == [CLASSES.index(l) for l in df['label']]
+assert (df['area'] == df['width'] * df['height']).all()
+assert df['aspect'].dtype.kind == 'f'
+assert df['is_large'].dtype == bool
+assert counts.sum() == len(df) and counts.loc['circle'] == 40
+assert list(stats.columns) == ['count', 'mean_area']
+assert stats.loc['triangle', 'count'] == 15
+print('PASS')
+display(stats)
+
+#%% md
+### Why this way
+
+**`.map(dict)` for label -> id.** Vectorized, and unknown labels become `NaN` rather than
+raising - which is how you *discover* a typo'd class name in a manifest. Check with
+`df['class_id'].isna().any()`.
+
+**`width / height` gives float automatically**, because pandas follows NumPy's true-division
+rule. If you want integer division you have to ask for `//` explicitly - the opposite of
+Python 2 muscle memory.
+
+**Named aggregation** (`agg(count=('path', 'size'), ...)`) is the modern form. It names the
+output columns directly, so you never have to deal with the MultiIndex that
+`agg(['count', 'mean'])` produces. Note `'size'` counts all rows while `'count'` skips
+`NaN` - for a row count you want `'size'`.
+
+**Why no `.apply(axis=1)`.** It runs your Python function once per row, so it's 10-100x
+slower than column arithmetic and it silently converts your neat dtypes to `object`. Column
+expressions like `df.width * df.height` run in C over the whole column.
+
+**The `is_large` comparison returns a real `bool` dtype**, so `.sum()` counts and `~` negates.
+If you'd built it with `np.where(cond, 'yes', 'no')` you'd have strings, and every downstream
+filter would be a string comparison.
+
+#%% md
+---
+## Task 7 - Stratified split
+
+#%% code
+def stratified_split(frame, label_col='label', val_frac=0.2, seed=0):
+    r = np.random.default_rng(seed)
+    out = frame.copy()
+    out['split'] = 'train'
+    for _, idx in out.groupby(label_col).groups.items():
+        idx = np.array(idx)
+        r.shuffle(idx)
+        n_val = int(round(val_frac * len(idx)))
+        out.loc[idx[:n_val], 'split'] = 'val'
+    return out
+
+
+split_df = stratified_split(df, val_frac=0.2, seed=0)
+
+share = split_df.groupby('label')['split'].apply(lambda s: (s == 'val').mean())
+assert set(split_df['split'].unique()) == {'train', 'val'}
+assert len(split_df) == len(df)
+assert (abs(share - 0.2) < 0.05).all()
+assert split_df.loc[split_df.split == 'val', 'label'].nunique() == 3
+print('PASS  per-class val share:', share.round(3).to_dict())
+display(pd.crosstab(split_df['split'], split_df['label']))
+
+#%% md
+### Why this way
+
+**`groupby(...).groups` gives you `{label: Index}`** - the original row labels per class.
+Shuffle those indices and take the first `n_val`: that's a per-class random split, which is
+what "stratified" means.
+
+**`out.loc[idx, 'split'] = 'val'` writes by index label, not position.** This is why I
+`.copy()` first and why `.loc` (not `df[mask][col]`) matters: chained indexing writes to a
+temporary and silently does nothing, which is what `SettingWithCopyWarning` is trying to
+tell you.
+
+**`int(round(...))` not `int(...)`.** Truncation systematically under-fills validation -
+with 15 triangles and `val_frac=0.2` you'd get `int(3.0)`, fine, but at `val_frac=0.25`
+you'd get `int(3.75) = 3` instead of 4. Small here; on a 50-class dataset the bias compounds.
+
+**What this does not handle** (and real projects need):
+
+- **Group leakage.** If several images come from the same patient/video/scene, they must all
+  land on the same side of the split, or your validation score is inflated. That's
+  `sklearn.model_selection.GroupShuffleSplit` / `StratifiedGroupKFold`.
+- **Multi-label.** With several labels per image, "stratify" needs iterative stratification.
+- The scikit-learn one-liner for the simple case:
+
+```python
+from sklearn.model_selection import train_test_split
+train_df, val_df = train_test_split(df, test_size=0.2, stratify=df['label'], random_state=0)
+```
+
+Worth knowing both: the library call for real work, the manual version so you know what it
+does.
+
+#%% md
+---
+## Task 8 - Manifest to batch
+
+#%% code
+def load_batch(frame, size=32):
+    arrs = []
+    for p in frame['path']:
+        im = Image.open(p).convert('L').resize((size, size), Image.BILINEAR)
+        arrs.append(np.asarray(im, dtype=np.float32) / 255.0)
+    x = np.stack(arrs)[:, None, :, :]                       # (N, H, W) -> (N, 1, H, W)
+    y = frame['class_id'].to_numpy(dtype=np.int64)
+    return x, y
+
+
+X, y = load_batch(split_df[split_df.split == 'train'], size=32)
+
+assert X.ndim == 4 and X.shape[1] == 1 and X.shape[2:] == (32, 32)
+assert X.dtype == np.float32 and X.min() >= 0.0 and X.max() <= 1.0
+assert y.dtype == np.int64 and y.shape == (X.shape[0],)
+assert set(np.unique(y)) == {0, 1, 2}
+print('PASS  X', X.shape, '| y', y.shape, '| mean', X.mean(axis=(0, 2, 3)).round(4))
+
+fig, axes = plt.subplots(1, 8, figsize=(13, 2))
+for ax, i in zip(axes, np.random.default_rng(2).permutation(len(X))[:8]):
+    ax.imshow(X[i, 0]); ax.set_title(CLASSES[y[i]], fontsize=9); ax.axis('off')
+plt.tight_layout()
+
+#%% md
+### Why this way
+
+**A Python loop is correct here.** The expensive part is decoding a PNG, which is C code
+inside PIL; the loop overhead is noise. Vectorize arithmetic, not I/O. (The real fix for
+slow I/O is parallelism - `DataLoader(num_workers=4)` in chapter 4.)
+
+**`.convert('L')`** guarantees single-channel output even if a file sneaks in as RGB or
+palette-mode. Without it, `np.stack` fails with a shape mismatch on one bad file out of a
+thousand - always normalize the mode on load.
+
+**`resize((size, size))` takes `(width, height)`** - PIL is the one library in this stack
+that puts x first. `np.asarray` then gives you `(height, width)`. Square sizes hide the bug;
+try `resize((64, 32))` and watch the array come out `(32, 64)`.
+
+**`[:, None, :, :]` adds the channel axis** after stacking. `np.stack` alone gives `(N,H,W)`,
+which a `Conv2d` will reject with a confusing 3-vs-4-dim error.
+
+**`frame['class_id']`, not `enumerate`.** Deriving `y` from the same rows you just read
+pixels from is what keeps images and labels aligned. Rebuilding labels from folder order,
+or forgetting `reset_index` after a filter and then indexing positionally, is *the* classic
+label-shuffling bug - and the only reliable way to catch it is the plot above. Make that
+plot every time you build a new dataset.
+
+#%% md
+---
+## One more idea worth stealing
+
+The plot at the end of task 8 is not decoration - it is a test. In CV, the highest-value
+sanity check is almost always "render the thing and look at it":
+
+- After building a dataset: plot images with their labels as titles.
+- After augmentation: plot the augmented batch (chapter 4).
+- After a forward pass: plot the images the model got most confidently wrong (chapter 4).
+- After segmentation: plot image / ground-truth mask / prediction side by side (chapter 6).
+
+A silent shape or label bug can still produce a plausible loss curve. It cannot survive
+being looked at.
+
+Next: [Chapter 2 - ML foundations](../../docs/02_ml_foundations.md)

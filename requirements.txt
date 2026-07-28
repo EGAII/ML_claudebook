@@ -1,0 +1,22 @@
+# Local (CPU) environment for chapters 1-3. On Colab every one of these is
+# preinstalled, so you do not need this file there.
+#
+#   python -m venv .venv
+#   .venv\Scripts\activate          # Windows
+#   pip install -r requirements.txt
+#
+# For a CPU-only torch install (much smaller download than the CUDA wheels):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+numpy>=1.26
+pandas>=2.1
+matplotlib>=3.8
+scipy>=1.11
+scikit-learn>=1.4
+pillow>=10.0
+opencv-python-headless>=4.9
+torch>=2.2
+torchvision>=0.17
+jupyterlab>=4.0
+ipywidgets>=8.1
+tqdm>=4.66
