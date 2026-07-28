@@ -1,0 +1,563 @@
+#out exercises/solutions/sol04_cnn.ipynb
+#gpu on
+
+#%% md
+# Solutions 4 - CNN classification (FashionMNIST)
+
+Answers to [`ex04_cnn.ipynb`](../ex04_cnn.ipynb), with the reasoning.
+
+> **GPU: Runtime -> Change runtime type -> T4 GPU.**
+
+#%% code
+import math, time, sys
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+USE_AMP = device.type == 'cuda'
+print('torch', torch.__version__, '| device', device)
+
+try:
+    import google.colab  # noqa: F401
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+DATA_DIR = '/content/data' if IN_COLAB else './data'
+NUM_WORKERS = 2 if IN_COLAB else 0
+
+def set_seed(seed=0):
+    import random
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+set_seed(0)
+torch.backends.cudnn.benchmark = True
+plt.rcParams['figure.dpi'] = 110
+
+FM_MEAN, FM_STD = (0.2860,), (0.3530,)
+raw_train = datasets.FashionMNIST(DATA_DIR, train=True, download=True)
+CLASSES = raw_train.classes
+print('classes:', CLASSES)
+
+#%% md
+---
+## Task 1 - Two transform pipelines
+
+#%% code
+train_tf = transforms.Compose([
+    transforms.RandomCrop(28, padding=2, padding_mode='reflect'),
+    transforms.RandomRotation(10),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize(FM_MEAN, FM_STD),
+])
+
+eval_tf = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(FM_MEAN, FM_STD),
+])
+
+train_ds = datasets.FashionMNIST(DATA_DIR, train=True, transform=train_tf)
+val_ds = datasets.FashionMNIST(DATA_DIR, train=False, transform=eval_tf)
+
+names_train = [type(t).__name__ for t in train_tf.transforms]
+names_eval = [type(t).__name__ for t in eval_tf.transforms]
+assert names_eval == ['ToTensor', 'Normalize']
+assert names_train.index('ToTensor') > max(i for i, n in enumerate(names_train) if 'Random' in n)
+print('PASS  train:', names_train)
+print('      eval :', names_eval)
+
+#%% md
+### Which augmentations, and why
+
+**Kept:**
+
+- **`RandomCrop(28, padding=2)`** - simulates small translation. Cheap, always safe, and the
+  single most useful augmentation for small images. `padding_mode='reflect'` avoids teaching the
+  network that black borders are a feature.
+- **`RandomRotation(10)`** - clothes are photographed roughly upright but not perfectly. 10
+  degrees is realistic; 45 would create images unlike anything at test time.
+- **`RandomHorizontalFlip()`** - a mirrored sneaker is still a sneaker. Fine here.
+
+**Rejected:**
+
+- **`RandomVerticalFlip`** - an upside-down shirt never appears in the test set. Augmenting with
+  data your deployment distribution doesn't contain *costs* you accuracy: capacity spent
+  learning a symmetry that isn't real.
+- **`ColorJitter`** - these are 1-channel grayscale silhouettes; hue/saturation are meaningless.
+  Brightness/contrast would be defensible but adds little.
+- **Aggressive `RandomResizedCrop`** - at 28x28 a scale-0.5 crop can remove the one detail
+  (a heel, a collar) that separates two classes. It's great at 224x224 and harmful here.
+
+**The principle:** augment with transformations that occur in your real test distribution and
+preserve the label. Everything else is noise you're forcing the model to fit around.
+
+**Order:** PIL-based geometric transforms first, then `ToTensor()`, then `Normalize`. `ToTensor`
+is the PIL -> tensor boundary; `Normalize` only works on tensors. (`transforms.v2` relaxes this
+by accepting both, but the ordering habit is still the right one.)
+
+**One nuance about crop-then-rotate.** `RandomRotation` fills the corners it exposes with 0,
+which after normalization is not the same as "background". At 10 degrees on a 28x28 image it's
+a couple of pixels and harmless - but on larger rotations you'd want `fill=` set to the
+background value.
+
+#%% md
+---
+## Task 2 - Loaders and a look at a batch
+
+#%% code
+train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=NUM_WORKERS,
+                          pin_memory=USE_AMP, drop_last=True)
+val_loader = DataLoader(val_ds, batch_size=256, shuffle=False, num_workers=NUM_WORKERS,
+                        pin_memory=USE_AMP)
+
+def denormalize(t, mean=FM_MEAN, std=FM_STD):
+    m = torch.tensor(mean).view(-1, 1, 1)
+    s = torch.tensor(std).view(-1, 1, 1)
+    img = (t.detach().cpu() * s + m).clamp(0, 1)
+    return img.squeeze(0).numpy()          # (1, H, W) -> (H, W)
+
+
+xb, yb = next(iter(train_loader))
+assert len(train_loader) == 60000 // 128
+assert denormalize(xb[0]).shape == (28, 28)
+print(f'PASS  batch {tuple(xb.shape)} | mean {xb.mean():+.3f} std {xb.std():.3f}')
+
+fig, axes = plt.subplots(2, 8, figsize=(13, 3.6))
+for ax, i in zip(axes.ravel(), range(16)):
+    ax.imshow(denormalize(xb[i]), cmap='gray'); ax.set_title(CLASSES[yb[i]], fontsize=7); ax.axis('off')
+plt.suptitle('training batch after transforms')
+plt.tight_layout()
+
+#%% md
+### Why these settings
+
+**`drop_last=True` on train only.** The final batch would have `60000 % 128 = 96` samples. That
+is not a problem for the loss (which averages), but BatchNorm computes statistics *from the
+batch*, so a smaller final batch gives noisier statistics that then pollute the running
+averages used at eval time. Dropping 96 of 60,000 images costs nothing.
+
+**Never on validation** - you'd silently evaluate on fewer samples and report a number computed
+on a different set than you think.
+
+**`batch_size=256` for validation.** No backward pass means no stored activations, so you can
+afford a bigger batch, and bigger batches are more efficient. It changes nothing about the
+result (evaluation is batch-independent, unlike training).
+
+**`pin_memory=True` only with a GPU.** It allocates page-locked host memory so the DMA transfer
+can overlap with compute. On CPU it's pure overhead, hence gating on `USE_AMP`.
+
+**`squeeze(0)` and not `squeeze()`** in `denormalize` - name the axis. With a 1x1x1 tensor a
+bare `squeeze()` would return a scalar and `imshow` would fail with a confusing error.
+
+**Why `.clamp(0, 1)`.** After un-normalizing, floating point rounding can put a value at
+1.0000001, and `imshow` silently rescales the whole image when it sees out-of-range floats,
+making your check of "do the colours look right" meaningless.
+
+#%% md
+---
+## Task 3 - The model
+
+#%% code
+def conv_block(c_in, c_out, k=3):
+    return nn.Sequential(
+        nn.Conv2d(c_in, c_out, k, padding=k // 2, bias=False),
+        nn.BatchNorm2d(c_out),
+        nn.ReLU(inplace=True),
+    )
+
+
+class FashionCNN(nn.Module):
+    def __init__(self, n_classes=10, c_in=1, p_drop=0.2):
+        super().__init__()
+        self.stage1 = nn.Sequential(conv_block(c_in, 24), nn.MaxPool2d(2))     # 28 -> 14
+        self.stage2 = nn.Sequential(conv_block(24, 48), nn.MaxPool2d(2))       # 14 -> 7
+        self.stage3 = nn.Sequential(conv_block(48, 96), nn.MaxPool2d(2))       # 7  -> 3
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Dropout(p_drop), nn.Linear(96, n_classes))
+
+    def forward(self, x):
+        return self.head(self.stage3(self.stage2(self.stage1(x))))
+
+
+model = FashionCNN().to(device)
+n_params = sum(p.numel() for p in model.parameters())
+assert model(torch.randn(4, 1, 28, 28, device=device)).shape == (4, 10)
+assert n_params < 120_000
+assert model(torch.randn(1, 1, 56, 56, device=device)).shape == (1, 10)
+print(f'PASS  {n_params:,} parameters')
+
+h = torch.randn(1, 1, 28, 28, device=device)
+for name, mod in model.named_children():
+    h = mod(h)
+    print(f'  after {name:8} {tuple(h.shape)}')
+
+#%% md
+### Why this shape
+
+**`c_in=1`, not 3.** FashionMNIST is grayscale. Passing a 1-channel image to a 3-channel conv
+raises immediately - a good error, unlike most. (In chapter 5 you'll meet the opposite problem:
+a pretrained model *demands* 3 channels, and you have to repeat the gray channel or replace the
+stem.)
+
+**28 -> 14 -> 7 -> 3.** The third pool halves 7 to 3, discarding the odd row and column (floor
+division again). That's fine for a classifier because global average pooling follows. It would
+*not* be fine in a segmentation decoder, where you must restore the exact input size - which is
+why chapter 6's U-Net either pads to a multiple of 16 or crops the skip connections.
+
+**GAP is what passes the 56x56 assertion.** `AdaptiveAvgPool2d(1)` reduces any spatial size to
+1x1, so `Linear(96, 10)` always sees 96 features. The alternative - `Flatten()` on a 3x3x96 map
+into `Linear(864, 10)` - would hard-code 28x28 input *and* add 8,640 parameters.
+
+**Dropout only in the head.** Dropout between convolutions was standard pre-2015 and is now
+mostly abandoned: BatchNorm already regularizes, and dropout corrupts the batch statistics BN
+depends on. The one place it still helps is immediately before the final linear layer.
+
+**Where the parameters live:** the 48->96 conv holds 41,472 of ~53,000 - about 78%. Widening
+late stages is expensive in parameters; widening early stages is expensive in FLOPs.
+
+#%% md
+---
+## Task 4 - Sanity checks
+
+#%% code
+criterion = nn.CrossEntropyLoss()
+
+def initial_loss(batch_x, batch_y):
+    set_seed(0)
+    fresh = FashionCNN().to(device)
+    fresh.eval()
+    with torch.no_grad():
+        return criterion(fresh(batch_x), batch_y).item()
+
+
+init_loss = initial_loss(xb.to(device), yb.to(device))
+print(f'ln(10) = {math.log(10):.4f} | measured {init_loss:.4f}')
+assert abs(init_loss - math.log(10)) < 0.3
+print('PASS')
+
+#%% code
+def overfit_one_batch(xs, ys, steps=250, lr=1e-3):
+    set_seed(0)
+    m = FashionCNN(p_drop=0.0).to(device)         # dropout OFF - this is a capacity check
+    opt = torch.optim.Adam(m.parameters(), lr=lr)
+    m.train()
+    losses = []
+    for _ in range(steps):
+        opt.zero_grad(set_to_none=True)
+        loss = criterion(m(xs), ys)
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+
+
+xs, ys = xb[:8].to(device), yb[:8].to(device)
+losses = overfit_one_batch(xs, ys)
+assert losses[-1] < 0.01
+print(f'PASS  {losses[0]:.4f} -> {losses[-1]:.2e}')
+
+plt.figure(figsize=(5, 3))
+plt.plot(losses); plt.yscale('log'); plt.xlabel('step'); plt.ylabel('loss'); plt.grid(alpha=0.3)
+
+#%% md
+### Why these two checks are worth so much
+
+**The `ln(C)` check** tests something no shape assertion can: that the *labels* are in the range
+the loss expects and that the output layer isn't accidentally activated. A softmax applied
+before `CrossEntropyLoss` shifts this number. Labels of the wrong scale blow it up. It costs
+two seconds and it is real information.
+
+`ln(10) = 2.303` because an untrained network's logits are near-random and small, so softmax is
+roughly uniform at 1/10, and cross-entropy is `-ln(1/10)`. For binary problems expect
+`ln(2) = 0.693`.
+
+**Overfitting one batch** is the single highest-value habit in this chapter. It separates two
+completely different failure modes:
+
+- **Can't reach ~0** -> a *bug*. Labels misaligned with images, gradients not flowing (a
+  detached tensor, `requires_grad=False`, a missing `optimizer.step()`), wrong loss, or an
+  architecture that destroys information. Tuning the learning rate will not help.
+- **Reaches ~0 but validation is bad** -> not a bug. That's overfitting/regularization/data,
+  i.e. the normal work.
+
+Details that make the check trustworthy: **dropout off** (its noise keeps the loss floor above
+zero), **no augmentation** (the samples must be identical every step), **Adam** (it doesn't need
+LR tuning for this), and **8 samples** (enough that a trivially broken model still fails, small
+enough to memorise in seconds).
+
+Keep the assertion in your training scripts behind a `--smoke-test` flag. It catches regressions
+after a refactor faster than any test suite you'd write by hand.
+
+#%% md
+---
+## Task 5 - Train and evaluate functions
+
+#%% code
+def train_one_epoch(model, loader, criterion, optimizer, device, scheduler=None):
+    model.train()
+    total_loss, correct, seen = 0.0, 0, 0
+    for xb, yb in loader:
+        xb = xb.to(device, non_blocking=True)
+        yb = yb.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(xb)
+        loss = criterion(logits, yb)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * yb.size(0)
+        correct += (logits.argmax(1) == yb).sum().item()
+        seen += yb.size(0)
+    if scheduler is not None:
+        scheduler.step()
+    return total_loss / seen, correct / seen
+
+
+@torch.no_grad()
+def evaluate(model, loader, criterion, device, return_preds=False):
+    model.eval()
+    total_loss, correct, seen = 0.0, 0, 0
+    ts, ps, prs = [], [], []
+    for xb, yb in loader:
+        xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+        logits = model(xb)
+        total_loss += criterion(logits, yb).item() * yb.size(0)
+        pred = logits.argmax(1)
+        correct += (pred == yb).sum().item()
+        seen += yb.size(0)
+        if return_preds:
+            ts.append(yb.cpu()); ps.append(pred.cpu()); prs.append(torch.softmax(logits.float(), 1).cpu())
+    if return_preds:
+        return (total_loss / seen, correct / seen,
+                torch.cat(ts).numpy(), torch.cat(ps).numpy(), torch.cat(prs).numpy())
+    return total_loss / seen, correct / seen
+
+
+set_seed(0)
+probe = FashionCNN().to(device)
+opt = torch.optim.SGD(probe.parameters(), lr=0.05, momentum=0.9)
+small_loader = DataLoader(Subset(train_ds, range(2048)), batch_size=128, shuffle=True, drop_last=True)
+tl, ta = train_one_epoch(probe, small_loader, criterion, opt, device)
+vl, va = evaluate(probe, val_loader, criterion, device)
+_, _, yt, yp, pr = evaluate(probe, val_loader, criterion, device, return_preds=True)
+assert probe.training is False and np.allclose(pr.sum(1), 1.0, atol=1e-4)
+assert abs((yp == yt).mean() - va) < 1e-6
+print(f'PASS  train ({tl:.4f}, {ta:.4f}) | val ({vl:.4f}, {va:.4f})')
+
+#%% md
+### The details the assertions were checking
+
+**`total_loss += loss.item() * yb.size(0)`, then divide by `seen`.** `criterion` returns the
+*mean* over the batch. Summing batch means and dividing by the number of batches weights a
+96-sample batch the same as a 128-sample one. Multiply back up by the batch size and you get a
+true per-sample average. With `drop_last=True` the difference is small; on a validation set with
+a ragged last batch it's real, and it's the kind of tiny bias that makes two runs
+incomparable.
+
+**`.item()` is not optional.** `total_loss += loss` accumulates *tensors*, each holding a
+reference to its computation graph. Memory grows every step until you OOM. The same mistake in
+`history.append(loss)`.
+
+**`model.eval()` inside `evaluate`, and it stays off afterwards.** BatchNorm switches from batch
+statistics to running averages, and Dropout stops dropping. Forgetting it makes validation
+depend on batch composition - the classic "why does my val accuracy jitter between runs". The
+mirror-image bug is forgetting to switch *back* to `train()`, which is why `train_one_epoch`
+calls `model.train()` at the top rather than relying on the caller.
+
+**`@torch.no_grad()` as a decorator** applies to the whole function - no graph is built, so
+evaluation is faster and uses far less memory. Newer code sometimes prefers
+`torch.inference_mode()`, which is slightly stricter and slightly faster.
+
+**`scheduler.step()` once per epoch, after the loop.** `CosineAnnealingLR` is defined in epochs.
+Calling it per *batch* would race through the whole schedule in one epoch - a surprisingly
+common bug. (Per-batch scheduling is correct for `OneCycleLR` and warmup schedules; read the
+docs for the one you're using.)
+
+**`torch.softmax(logits.float(), 1)`** - the `.float()` matters under AMP, where logits come back
+as float16 and probabilities would be computed at reduced precision.
+
+#%% md
+---
+## Task 6 - Train
+
+#%% code
+EPOCHS = 8
+LR, WD = 0.05, 5e-4
+
+set_seed(0)
+model = FashionCNN().to(device)
+
+decay, no_decay = [], []
+for name, p in model.named_parameters():
+    if p.requires_grad:
+        (no_decay if p.ndim <= 1 else decay).append(p)
+print(f'weight decay on {len(decay)} tensors, excluded for {len(no_decay)} (BN weights + biases)')
+
+optimizer = torch.optim.SGD([{'params': decay, 'weight_decay': WD},
+                             {'params': no_decay, 'weight_decay': 0.0}],
+                            lr=LR, momentum=0.9, nesterov=True)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+
+history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+best_acc, best_state = 0.0, None
+print(f'\n{"ep":>3} {"lr":>7} {"tr_loss":>9} {"tr_acc":>8} {"va_loss":>9} {"va_acc":>8} {"time":>7}')
+for epoch in range(EPOCHS):
+    t0 = time.perf_counter()
+    lr_now = optimizer.param_groups[0]['lr']
+    tr_loss, tr_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scheduler)
+    va_loss, va_acc = evaluate(model, val_loader, criterion, device)
+    for k, v in [('train_loss', tr_loss), ('train_acc', tr_acc), ('val_loss', va_loss), ('val_acc', va_acc)]:
+        history[k].append(v)
+    star = ''
+    if va_acc > best_acc:
+        best_acc = va_acc
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        star = ' *'
+    print(f'{epoch:3d} {lr_now:7.4f} {tr_loss:9.4f} {tr_acc:8.4f} {va_loss:9.4f} {va_acc:8.4f} '
+          f'{time.perf_counter() - t0:6.1f}s{star}')
+
+assert best_acc > 0.90, f'best {best_acc:.4f}'
+print(f'\nPASS  best val accuracy {best_acc:.4f}')
+model.load_state_dict(best_state)         # restore the best, not the last
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.4))
+axes[0].plot(history['train_loss'], marker='.', label='train')
+axes[0].plot(history['val_loss'], marker='.', label='val'); axes[0].set_ylabel('loss')
+axes[1].plot(history['train_acc'], marker='.', label='train')
+axes[1].plot(history['val_acc'], marker='.', label='val'); axes[1].set_ylabel('accuracy')
+for ax in axes:
+    ax.set_xlabel('epoch'); ax.legend(); ax.grid(alpha=0.3)
+plt.tight_layout()
+
+#%% md
+### Why the parameter groups, and why restore the best state
+
+**`p.ndim <= 1` is the idiom for "biases and normalization parameters".** Conv and linear
+*weights* are 2D or 4D; biases, BatchNorm `weight` and BatchNorm `bias` are all 1D. So one
+condition catches all of them without string-matching on names (which breaks the moment you
+rename a layer).
+
+**Why exclude them.** Weight decay is a prior that small weights generalize better. For a
+BatchNorm *scale*, "small" means "squash this channel toward zero" - it fights the
+normalization it's meant to support, and empirically costs a few tenths of a percent. Biases
+have no such prior either: they just shift the output. This is one of those free wins that
+almost every from-scratch training script gets wrong.
+
+**`best_state` with `.detach().cpu().clone()`.** Without `clone()` you'd store *references* to
+live tensors, which keep mutating as training continues - so your "best" snapshot would end up
+identical to the final weights. This is a genuinely nasty bug because the code looks right and
+the numbers are merely slightly worse. Save to disk with `torch.save` and the serialization
+does the copy for you.
+
+**Restoring the best beats stopping early.** Same effect as early stopping, but you also get the
+full curve, so you can see whether it was still improving. Training is cheap; deciding blindly
+is not.
+
+**A note on `nesterov=True`.** Nesterov momentum evaluates the gradient at the *look-ahead*
+position, which damps overshoot slightly. It's a small, free improvement over plain momentum.
+`momentum=0.9` is the near-universal default; treat it as a constant, not a knob.
+
+#%% md
+---
+## Task 7 - Evaluate beyond one number
+
+#%% code
+def confusion_matrix(y_true, y_pred, k=10):
+    y_true = np.asarray(y_true).ravel().astype(np.int64)
+    y_pred = np.asarray(y_pred).ravel().astype(np.int64)
+    return np.bincount(y_true * k + y_pred, minlength=k * k).reshape(k, k)
+
+
+_, final_acc, y_true, y_pred, y_prob = evaluate(model, val_loader, criterion, device, return_preds=True)
+cm = confusion_matrix(y_true, y_pred)
+recall = np.diag(cm) / cm.sum(1)
+precision = np.diag(cm) / np.maximum(cm.sum(0), 1)
+
+print(f'accuracy {final_acc:.4f}\n')
+print(f'{"class":14} {"recall":>7} {"precis":>7} {"support":>8}')
+for i, c in enumerate(CLASSES):
+    print(f'{c:14} {recall[i]:7.3f} {precision[i]:7.3f} {cm[i].sum():8d}')
+print(f'\nworst class: {CLASSES[recall.argmin()]} at {recall.min():.3f}')
+
+off = cm.copy(); np.fill_diagonal(off, 0)
+pairs = np.dstack(np.unravel_index(np.argsort(-off.ravel()), off.shape))[0][:4]
+print('\ntop confusions:')
+for i, j in pairs:
+    print(f'  true {CLASSES[i]:14} -> predicted {CLASSES[j]:14} {off[i, j]:4d}')
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+axes[0].imshow(cm, cmap='Blues'); axes[0].set_title('counts')
+norm_cm = cm / cm.sum(1, keepdims=True)
+im = axes[1].imshow(norm_cm, cmap='Blues', vmin=0, vmax=1)
+axes[1].set_title('row-normalized (diagonal = recall)')
+for ax in axes:
+    ax.set_xticks(range(10)); ax.set_yticks(range(10))
+    ax.set_xticklabels(CLASSES, rotation=45, ha='right', fontsize=7)
+    ax.set_yticklabels(CLASSES, fontsize=7)
+    ax.set_xlabel('predicted'); ax.set_ylabel('actual')
+fig.colorbar(im, ax=axes[1], shrink=0.8)
+plt.tight_layout()
+
+#%% code
+raw_val = datasets.FashionMNIST(DATA_DIR, train=False)
+wrong = np.where(y_pred != y_true)[0]
+order = wrong[np.argsort(-y_prob[wrong].max(1))]
+print(f'{len(wrong)} mistakes of {len(y_true)}')
+
+fig, axes = plt.subplots(2, 6, figsize=(12, 4.4))
+for ax, idx in zip(axes.ravel(), order[:12]):
+    ax.imshow(raw_val[int(idx)][0], cmap='gray')
+    ax.set_title(f'true {CLASSES[y_true[idx]]}\npred {CLASSES[y_pred[idx]]} ({y_prob[idx].max():.2f})', fontsize=7)
+    ax.axis('off')
+plt.suptitle('most confident mistakes')
+plt.tight_layout()
+
+#%% md
+### What to do about the worst class
+
+On FashionMNIST the worst class is almost always **Shirt**, and the confusion matrix says
+exactly why: it gets predicted as T-shirt/top, Coat, and Pullover. Those four classes are
+genuinely overlapping silhouettes at 28x28 - a short-sleeved shirt and a t-shirt differ mainly
+in texture and collar detail, which is a handful of pixels.
+
+Ordered by what I'd actually try:
+
+1. **Look at the mistakes first** (the plot above). If humans can't tell them apart either,
+   the ceiling is in the *data*, and model changes are wasted effort. This is the step people
+   skip.
+2. **More resolution / receptive field.** The distinguishing detail is tiny. Upsampling to 56x56
+   or removing one pooling stage gives the network more to work with. Usually the biggest win
+   when classes differ in fine detail.
+3. **Class weights or a balanced sampler** - `CrossEntropyLoss(weight=...)` to make Shirt errors
+   cost more. Here the classes are perfectly balanced (6,000 each), so this addresses *difficulty*,
+   not imbalance, and typically trades Shirt recall for T-shirt recall. Know what you're buying.
+4. **Targeted augmentation** - augmentations that preserve the discriminative detail (small
+   crops, mild rotation) rather than destroying it (aggressive scaling).
+5. **A bigger model or transfer learning** (chapter 5). Last, not first - it's the most
+   expensive change and often the smallest gain on a dataset like this.
+6. **Merge the classes.** If your product doesn't need to distinguish shirt from t-shirt, don't
+   force the model to. Reframing the task is a legitimate, underused option.
+
+And the honest note: chasing the worst class often just moves the errors around. Decide what the
+*cost* of each mistake is before optimizing anything - a confusion between two coat types may be
+free, while a confusion between "Sandal" and "Bag" might not be.
+
+#%% md
+---
+## The one habit to take from this chapter
+
+Before every training run, in this order:
+
+1. Plot a batch after transforms, with labels. **Look at it.**
+2. Check the initial loss is `ln(C)`.
+3. Overfit 8 samples to ~0.
+
+Three minutes, and it catches the class of bug that otherwise costs you a day - the kind where
+the code runs, the loss decreases, and the model is quietly broken.
+
+Next: [Chapter 5 - Transfer learning](../../docs/05_transfer_learning.md)

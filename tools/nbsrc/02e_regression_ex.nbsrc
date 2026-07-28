@@ -1,0 +1,389 @@
+#out exercises/ex02_regression.ipynb
+#gpu off
+
+#%% md
+# Exercise 2 - Regression, gradient descent, autograd
+
+Eight tasks. Runs on CPU. Each cell asserts its way to a `PASS`.
+
+Task 5 is the one that matters most: a training loop with three real bugs in it, of the kind
+you will write yourself at some point. Find them by reading, not by running.
+
+#%% code
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+
+plt.rcParams['figure.dpi'] = 110
+rng = np.random.default_rng(0)
+torch.manual_seed(0)
+
+TRUE_W = np.array([2.0, -3.0], dtype=np.float64)
+TRUE_B = 0.5
+N = 200
+
+Xreg = rng.uniform(-2, 2, size=(N, 2))
+yreg = Xreg @ TRUE_W + TRUE_B + rng.normal(0, 0.3, size=N)
+
+def make_blobs(n=400, seed=1):
+    r = np.random.default_rng(seed)
+    n0 = n // 2
+    a = r.normal([-1.3, -0.5], [1.0, 0.9], size=(n0, 2))
+    b = r.normal([1.4, 0.9], [1.0, 0.9], size=(n - n0, 2))
+    X = np.vstack([a, b]).astype(np.float32)
+    y = np.concatenate([np.zeros(n0), np.ones(n - n0)]).astype(np.float32)
+    i = r.permutation(n)
+    return X[i], y[i]
+
+Xc, yc = make_blobs()
+ncut = int(0.75 * len(Xc))
+Xc_tr, Xc_va, yc_tr, yc_va = Xc[:ncut], Xc[ncut:], yc[:ncut], yc[ncut:]
+
+from sklearn.datasets import load_digits
+_d = load_digits()
+_perm = np.random.default_rng(0).permutation(len(_d.data))
+Xd = _d.data.astype(np.float32)[_perm]
+yd = _d.target.astype(np.int64)[_perm]
+d_images = _d.images[_perm]
+_ntr = int(0.8 * len(Xd))
+Xd_tr, Xd_va, yd_tr, yd_va = Xd[:_ntr], Xd[_ntr:], yd[:_ntr], yd[_ntr:]
+
+print('regression', Xreg.shape, '| blobs', Xc_tr.shape, Xc_va.shape, '| digits', Xd_tr.shape, Xd_va.shape)
+print('setup ok')
+
+#%% md
+---
+## Task 1 - MSE and its gradient, verified numerically
+
+Implement `mse_loss` and `mse_grad` for $\hat y = Xw + b$. Then the cell checks your
+analytic gradient against a central finite difference. If that check fails, your gradient is
+wrong - no amount of tuning will save the model.
+
+Watch the factor of 2 and the transpose.
+
+#%% code
+def predict(X, w, b):
+    """(N, D) @ (D,) + scalar -> (N,)"""
+    # TODO
+    raise NotImplementedError
+
+def mse_loss(X, y, w, b):
+    """Mean squared error, as a Python float."""
+    # TODO
+    raise NotImplementedError
+
+def mse_grad(X, y, w, b):
+    """-> (dL/dw of shape (D,), dL/db as a float)"""
+    # TODO
+    raise NotImplementedError
+
+
+w_test = np.array([0.3, 0.9]); b_test = -0.2
+dw, db = mse_grad(Xreg, yreg, w_test, b_test)
+
+eps = 1e-6
+dw_num = np.array([(mse_loss(Xreg, yreg, w_test + eps * e, b_test) -
+                    mse_loss(Xreg, yreg, w_test - eps * e, b_test)) / (2 * eps) for e in np.eye(2)])
+db_num = (mse_loss(Xreg, yreg, w_test, b_test + eps) - mse_loss(Xreg, yreg, w_test, b_test - eps)) / (2 * eps)
+
+assert np.asarray(dw).shape == w_test.shape, f'dw shape {np.asarray(dw).shape} should equal w shape {w_test.shape}'
+assert isinstance(mse_loss(Xreg, yreg, w_test, b_test), float), 'mse_loss must return a float'
+assert np.allclose(dw, dw_num, atol=1e-4), f'dw wrong: analytic {np.round(dw, 5)} vs numeric {np.round(dw_num, 5)}'
+assert abs(db - db_num) < 1e-4, f'db wrong: analytic {db:.6f} vs numeric {db_num:.6f}'
+print('PASS  gradient check: dw', np.round(dw, 4), 'db', round(float(db), 4))
+
+#%% md
+---
+## Task 2 - Gradient descent
+
+Fill in the update. Recover `TRUE_W = [2, -3]` and `TRUE_B = 0.5` to within 0.05.
+
+#%% code
+def gradient_descent(X, y, lr=0.1, epochs=300):
+    w = np.zeros(X.shape[1]); b = 0.0
+    losses = []
+    for _ in range(epochs):
+        losses.append(mse_loss(X, y, w, b))
+        # TODO: compute gradients and update w, b
+        raise NotImplementedError
+    return w, b, losses
+
+
+w_gd, b_gd, losses = gradient_descent(Xreg, yreg, lr=0.1, epochs=300)
+
+assert np.allclose(w_gd, TRUE_W, atol=0.05), f'w = {np.round(w_gd, 4)}, expected ~{TRUE_W}'
+assert abs(b_gd - TRUE_B) < 0.05, f'b = {b_gd:.4f}, expected ~{TRUE_B}'
+assert losses[-1] < losses[0] and losses[-1] < 0.12, f'final loss {losses[-1]:.4f} too high'
+print(f'PASS  w = {np.round(w_gd, 4)}  b = {b_gd:.4f}  final loss {losses[-1]:.4f}')
+
+plt.figure(figsize=(5, 3))
+plt.plot(losses); plt.yscale('log'); plt.xlabel('epoch'); plt.ylabel('MSE'); plt.grid(alpha=0.3)
+plt.title('should fall smoothly and flatten')
+
+#%% md
+---
+## Task 3 - Closed form, as ground truth
+
+Solve the normal equation with `np.linalg.lstsq` (append a ones column for the bias) and
+confirm gradient descent got within `1e-3` of the exact optimum's loss.
+
+Use `lstsq`, not `np.linalg.inv(X.T @ X) @ X.T @ y` - the assertion at the end checks you
+understand why by comparing against an ill-conditioned matrix.
+
+#%% code
+def normal_equation(X, y):
+    """-> (w of shape (D,), b as float), the exact MSE minimizer."""
+    # TODO
+    raise NotImplementedError
+
+
+w_ex, b_ex = normal_equation(Xreg, yreg)
+loss_ex = mse_loss(Xreg, yreg, w_ex, b_ex)
+
+assert np.asarray(w_ex).shape == (2,), f'w shape {np.asarray(w_ex).shape}'
+assert loss_ex <= mse_loss(Xreg, yreg, w_gd, b_gd) + 1e-9, 'closed form must be at least as good as GD'
+assert mse_loss(Xreg, yreg, w_gd, b_gd) - loss_ex < 1e-3, 'GD did not converge close enough - train longer'
+print(f'PASS  closed form w = {np.round(w_ex, 4)} b = {b_ex:.4f} loss {loss_ex:.6f}')
+print(f'      gradient desc w = {np.round(w_gd, 4)} b = {b_gd:.4f} loss {mse_loss(Xreg, yreg, w_gd, b_gd):.6f}')
+
+ill = np.stack([Xreg[:, 0], Xreg[:, 0] + 1e-8 * rng.normal(size=N)], axis=1)   # near-duplicate columns
+ill_aug = np.hstack([ill, np.ones((N, 1))])
+print('\ncondition number of this X:', f'{np.linalg.cond(ill_aug):.2e}', '<- nearly singular')
+print('lstsq still returns something sane; inv(X.T @ X) is where you get garbage or a LinAlgError.')
+
+#%% md
+---
+## Task 4 - Autograd against calculus
+
+For $f(w) = \sum_i (w^3_i - 4 w_i)$, the derivative is $3w_i^2 - 4$.
+
+Compute it two ways and check they match: with autograd, and with the formula. Then explain
+in one line why `w.grad` is `None` before you call `.backward()`.
+
+#%% code
+def autograd_grad(values):
+    """values: a list of floats. Build w with requires_grad, compute f = sum(w^3 - 4w),
+    backpropagate, and return w.grad as a tensor."""
+    w = torch.tensor(values, requires_grad=True)
+    # TODO: build f, call backward, return the gradient
+    raise NotImplementedError
+
+
+VALUES = [1.0, 2.0, -1.5]
+grad_auto = autograd_grad(VALUES)
+grad_manual = 3 * torch.tensor(VALUES) ** 2 - 4
+
+assert grad_auto is not None, 'grad_auto is still None'
+assert torch.allclose(grad_auto, grad_manual, atol=1e-5), f'autograd {grad_auto} vs formula {grad_manual}'
+print('PASS  autograd', grad_auto.tolist(), '== formula', grad_manual.tolist())
+
+#%% md
+**Why is `w.grad` `None` before `.backward()`?** ...
+
+---
+## Task 5 - Find and fix three bugs
+
+`train_buggy` below runs without raising, and its accuracy is bad. There are **three real
+bugs**. Read it before you run it.
+
+Hints, in the order the bugs appear: what does `CrossEntropyLoss` expect as input? What
+happens to `.grad` between steps? What are you appending to `history`?
+
+Write the corrected version as `train_fixed` and reach at least **0.92** validation accuracy.
+
+#%% code
+def train_buggy(Xtr, ytr, Xva, yva, epochs=150, lr=0.1):
+    Xtr_t = torch.from_numpy(Xtr); ytr_t = torch.from_numpy(ytr)
+    Xva_t = torch.from_numpy(Xva); yva_t = torch.from_numpy(yva)
+
+    torch.manual_seed(0)
+    model = nn.Linear(Xtr.shape[1], 10)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+
+    history = []
+    for epoch in range(epochs):
+        logits = model(Xtr_t)
+        probs = torch.softmax(logits, dim=1)
+        loss = criterion(probs, ytr_t)
+        loss.backward()
+        optimizer.step()
+        history.append(loss)
+
+    model.eval()
+    with torch.no_grad():
+        acc = (model(Xva_t).argmax(1) == yva_t).float().mean().item()
+    return model, history, acc
+
+
+mu, sd = Xd_tr.mean(0), Xd_tr.std(0) + 1e-6
+Xd_tr_s, Xd_va_s = (Xd_tr - mu) / sd, (Xd_va - mu) / sd
+
+_, _, acc_buggy = train_buggy(Xd_tr_s, yd_tr, Xd_va_s, yd_va)
+print(f'buggy version val accuracy: {acc_buggy:.4f}  (10 classes, so chance is 0.10)')
+
+#%% md
+**The three bugs are:**
+
+1. ...
+2. ...
+3. ...
+
+#%% code
+def train_fixed(Xtr, ytr, Xva, yva, epochs=150, lr=0.1):
+    """Same signature. Returns (model, history_of_floats, val_accuracy)."""
+    # TODO: your corrected loop
+    raise NotImplementedError
+
+
+model_fixed, hist_fixed, acc_fixed = train_fixed(Xd_tr_s, yd_tr, Xd_va_s, yd_va)
+
+assert isinstance(hist_fixed[0], float), 'history should hold floats, not tensors (use .item())'
+assert acc_fixed > 0.92, f'val accuracy {acc_fixed:.4f} - still below 0.92'
+assert hist_fixed[-1] < hist_fixed[0] / 2, 'loss should drop by at least half'
+print(f'PASS  fixed val accuracy {acc_fixed:.4f} (was {acc_buggy:.4f})')
+print(f'      loss {hist_fixed[0]:.4f} -> {hist_fixed[-1]:.4f}')
+
+plt.figure(figsize=(5, 3))
+plt.plot(hist_fixed); plt.xlabel('epoch'); plt.ylabel('cross-entropy'); plt.grid(alpha=0.3)
+plt.title('fixed loop')
+
+#%% md
+---
+## Task 6 - Binary logistic regression in PyTorch
+
+Train `nn.Linear(2, 1)` on the blobs with `BCEWithLogitsLoss`, then implement `predict` and
+`accuracy` from the raw logits. Target: **val accuracy > 0.90**.
+
+Do not apply `torch.sigmoid` before the loss.
+
+#%% code
+def train_logreg(Xtr, ytr, epochs=300, lr=0.5):
+    """-> trained nn.Linear(2, 1). Target shape must be (N, 1) float32."""
+    # TODO
+    raise NotImplementedError
+
+def predict(model, X):
+    """(N, 2) float32 numpy -> (N,) int64 numpy of 0/1. No sigmoid needed - why?"""
+    # TODO
+    raise NotImplementedError
+
+def accuracy(y_true, y_pred):
+    # TODO
+    raise NotImplementedError
+
+
+logreg = train_logreg(Xc_tr, yc_tr)
+pred_va = predict(logreg, Xc_va)
+acc = accuracy(yc_va, pred_va)
+
+assert isinstance(logreg, nn.Linear) and logreg.out_features == 1, 'model should be nn.Linear(2, 1)'
+assert pred_va.shape == (len(yc_va),), f'predictions should be (N,), got {pred_va.shape}'
+assert set(np.unique(pred_va)) <= {0, 1}, 'predictions must be 0/1'
+assert acc > 0.90, f'val accuracy {acc:.4f} below 0.90'
+print(f'PASS  val accuracy {acc:.4f} | w = {logreg.weight.detach().numpy().round(3)} b = {logreg.bias.item():.3f}')
+
+xx1 = np.linspace(Xc[:, 0].min() - 1, Xc[:, 0].max() + 1, 200)
+xx2 = np.linspace(Xc[:, 1].min() - 1, Xc[:, 1].max() + 1, 200)
+G1, G2 = np.meshgrid(xx1, xx2)
+grid = np.stack([G1.ravel(), G2.ravel()], 1).astype(np.float32)
+with torch.no_grad():
+    P = torch.sigmoid(logreg(torch.from_numpy(grid))).numpy().reshape(G1.shape)
+plt.figure(figsize=(5, 4))
+plt.contourf(G1, G2, P, levels=20, cmap='RdBu_r', alpha=0.6)
+plt.contour(G1, G2, P, levels=[0.5], colors='k')
+plt.scatter(*Xc_va[yc_va == 0].T, s=14, c='C0', edgecolor='k', lw=0.3)
+plt.scatter(*Xc_va[yc_va == 1].T, s=14, c='C3', edgecolor='k', lw=0.3)
+plt.title(f'decision boundary, val acc {acc:.3f}')
+
+#%% md
+---
+## Task 7 - Confusion matrix and per-class recall
+
+Using `model_fixed` from task 5 on the digits validation set:
+
+1. `confusion_matrix(y_true, y_pred, k)` with `np.bincount` - rows actual, cols predicted.
+2. `per_class_recall(cm)` -> `(k,)` array.
+3. Report the worst class and the most common off-diagonal confusion.
+
+No loops over samples.
+
+#%% code
+def confusion_matrix(y_true, y_pred, k=10):
+    """(k, k) int array. Rows = actual, cols = predicted."""
+    # TODO
+    raise NotImplementedError
+
+def per_class_recall(cm):
+    """(k,) float array: for each actual class, the fraction predicted correctly."""
+    # TODO
+    raise NotImplementedError
+
+
+with torch.no_grad():
+    val_pred = model_fixed(torch.from_numpy(Xd_va_s)).argmax(1).numpy()
+
+cm = confusion_matrix(yd_va, val_pred, k=10)
+rec = per_class_recall(cm)
+
+assert cm.shape == (10, 10), f'cm shape {cm.shape}'
+assert cm.sum() == len(yd_va), f'cm should total {len(yd_va)} samples, got {cm.sum()}'
+assert np.allclose(cm.sum(1), np.bincount(yd_va, minlength=10)), 'row sums must equal actual class counts'
+assert rec.shape == (10,) and np.all((rec >= 0) & (rec <= 1)), 'recall must be in [0, 1]'
+assert abs(np.diag(cm).sum() / cm.sum() - (val_pred == yd_va).mean()) < 1e-9, 'trace/total should equal accuracy'
+print('PASS')
+print('per-class recall:', {i: round(float(v), 3) for i, v in enumerate(rec)})
+print('worst class:', int(rec.argmin()), 'at', round(float(rec.min()), 3))
+
+off = cm.copy(); np.fill_diagonal(off, 0)
+i, j = np.unravel_index(off.argmax(), off.shape)
+print(f'most confused: true {i} predicted as {j}, {off[i, j]} times')
+
+plt.figure(figsize=(4.6, 4))
+plt.imshow(cm, cmap='Blues'); plt.colorbar(shrink=0.8)
+plt.xlabel('predicted'); plt.ylabel('actual'); plt.title('confusion matrix')
+plt.xticks(range(10)); plt.yticks(range(10))
+
+#%% md
+---
+## Task 8 (stretch) - Prove that scaling matters
+
+Train the same model twice at the same learning rate: once on raw digit pixels (0-16) and
+once standardized. Show the standardized run reaches a lower loss.
+
+Then answer: why must `mu`/`sd` come from the **training** split only?
+
+#%% code
+def train_and_final_loss(Xtr, ytr, Xva, yva, epochs=100, lr=0.05, seed=0):
+    """Train nn.Linear(D, 10) with CrossEntropyLoss; return (final_train_loss, val_acc)."""
+    # TODO
+    raise NotImplementedError
+
+
+loss_raw, acc_raw = train_and_final_loss(Xd_tr, yd_tr, Xd_va, yd_va)
+loss_std, acc_std = train_and_final_loss(Xd_tr_s, yd_tr, Xd_va_s, yd_va)
+
+print(f'raw pixels   final loss {loss_raw:.4f}  val acc {acc_raw:.4f}')
+print(f'standardized final loss {loss_std:.4f}  val acc {acc_std:.4f}')
+
+assert np.isfinite(loss_std), 'the standardized run should be stable - check your loop'
+if not np.isfinite(loss_raw):
+    print('\nthe raw run diverged to inf/nan outright - an even stronger version of the point')
+else:
+    assert loss_std < loss_raw, 'standardized run should reach a lower training loss at the same LR'
+print('PASS')
+
+#%% md
+**Why train-split statistics only?** ...
+
+---
+## Done
+
+- [ ] I can write the five-step loop from memory.
+- [ ] I know all three bugs from task 5 by sight.
+- [ ] I know why `CrossEntropyLoss` takes logits.
+- [ ] I check a hand-written gradient numerically before trusting it.
+
+Solutions: [`solutions/sol02_regression.ipynb`](solutions/sol02_regression.ipynb)

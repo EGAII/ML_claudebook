@@ -77,5 +77,25 @@ run this — the `.ipynb` files are committed. But if you want to edit a lesson 
 powershell -ExecutionPolicy Bypass -File tools/build_notebooks.ps1
 ```
 
+And to re-check structure and links afterwards:
+
+```bash
+powershell -ExecutionPolicy Bypass -File tools/validate.ps1
+```
+
 Edit the `.ipynb` directly if you prefer; just don't do both for the same notebook and
 expect them to stay in sync.
+
+### Status: cells are unexecuted
+
+Every notebook ships with empty outputs. They were written and structurally validated on a
+machine with no Python interpreter, so **the code has not been run yet** — Colab is the first
+execution. If a cell errors, it's a genuine bug and not a deliberate exercise; the exercise
+notebooks mark their gaps explicitly with `TODO` and `raise NotImplementedError`.
+
+The most likely places for version friction, if you hit any:
+
+- `matplotlib.cbook.get_sample_data('grace_hopper.jpg')` in chapter 3 (there's a synthetic
+  fallback built in if the sample image isn't available).
+- `torch.amp.GradScaler` vs `torch.cuda.amp.GradScaler` — chapters 4 and 6 try both.
+- `torchvision.transforms.v2` — chapter 3 falls back to v1.

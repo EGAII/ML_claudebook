@@ -1,0 +1,656 @@
+#out notebooks/04_cnn_classification.ipynb
+#gpu on
+
+#%% md
+# Chapter 4 - CNN image classification on CIFAR-10
+
+Companion to [`docs/04_cnn_classification.md`](../docs/04_cnn_classification.md).
+
+> ## GPU required
+> **Runtime -> Change runtime type -> T4 GPU**, then **Runtime -> Restart**.
+> On a T4 the whole notebook takes about 8-10 minutes (15 training epochs plus a 2x6-epoch
+> ablation at the end). On CPU, several hours - reduce `EPOCHS` if you have no GPU.
+
+What we build:
+
+1. A real data pipeline (`Dataset`, `DataLoader`, train/val transforms).
+2. The sanity checks that catch bugs *before* you waste an hour training: look at a batch,
+   check the initial loss, **overfit one batch**.
+3. A proper training loop with mixed precision, cosine LR schedule, and checkpointing.
+4. An evaluation that goes beyond one accuracy number.
+5. An ablation showing what augmentation is actually worth.
+
+#%% code
+import os, sys, time, math, json
+from pathlib import Path
+
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+import torchvision
+from torchvision import datasets, transforms
+
+print('python     ', sys.version.split()[0])
+print('torch      ', torch.__version__, '| torchvision', torchvision.__version__)
+print('cuda avail ', torch.cuda.is_available())
+
+if torch.cuda.is_available():
+    props = torch.cuda.get_device_properties(0)
+    print('gpu        ', props.name, f'{props.total_memory / 1e9:.1f} GB')
+else:
+    print('\n*** NO GPU. Runtime -> Change runtime type -> T4 GPU, then Runtime -> Restart. ***')
+    print('You can still run this notebook, but training will be very slow.')
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+USE_AMP = device.type == 'cuda'
+print('device     ', device, '| mixed precision:', USE_AMP)
+
+try:
+    import google.colab  # noqa: F401
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+
+DATA_DIR = '/content/data' if IN_COLAB else './data'
+CKPT_DIR = Path('/content/checkpoints' if IN_COLAB else './checkpoints')
+CKPT_DIR.mkdir(parents=True, exist_ok=True)
+print('data       ', DATA_DIR, '| checkpoints', CKPT_DIR)
+
+plt.rcParams['figure.dpi'] = 110
+
+#%% code
+def set_seed(seed=0):
+    import random
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+set_seed(0)
+torch.backends.cudnn.benchmark = True     # autotunes conv algorithms for fixed input shapes
+print('seeded. cudnn.benchmark = True (faster when every batch has the same shape)')
+print('\nFull determinism would also need:')
+print('  torch.backends.cudnn.deterministic = True; torch.backends.cudnn.benchmark = False')
+print('...which costs 10-30% speed. Turn it on when hunting a bug, not when training.')
+
+#%% md
+## 1. The data
+
+CIFAR-10: 60,000 32x32 colour images, 10 classes, 50k train / 10k test. ~170 MB download,
+cached for the session.
+
+Note the two **different** transform pipelines. This is the part people get wrong.
+
+#%% code
+CIFAR_MEAN = (0.4914, 0.4822, 0.4465)      # per-channel stats of the CIFAR-10 train split
+CIFAR_STD = (0.2470, 0.2435, 0.2616)
+
+train_tf = transforms.Compose([
+    transforms.RandomCrop(32, padding=4, padding_mode='reflect'),   # augmentation
+    transforms.RandomHorizontalFlip(),                              # augmentation
+    transforms.ToTensor(),                                          # HWC uint8 -> CHW float 0..1
+    transforms.Normalize(CIFAR_MEAN, CIFAR_STD),                    # preprocessing
+])
+
+eval_tf = transforms.Compose([
+    transforms.ToTensor(),                                          # NO augmentation
+    transforms.Normalize(CIFAR_MEAN, CIFAR_STD),                    # SAME preprocessing
+])
+
+t0 = time.perf_counter()
+train_ds = datasets.CIFAR10(DATA_DIR, train=True, download=True, transform=train_tf)
+val_ds = datasets.CIFAR10(DATA_DIR, train=False, download=True, transform=eval_tf)
+print(f'\ndownload/load took {time.perf_counter() - t0:.1f}s')
+
+CLASSES = train_ds.classes
+print('classes    ', CLASSES)
+print('train      ', len(train_ds), 'images')
+print('val        ', len(val_ds), 'images')
+print('class balance:', np.bincount(np.array(train_ds.targets)))
+
+x0, y0 = train_ds[0]
+print(f'\none sample: {tuple(x0.shape)} {x0.dtype}, label {y0} = {CLASSES[y0]}')
+print(f'value range after normalization: ({x0.min():.2f}, {x0.max():.2f}) - centred near 0, not 0..1')
+
+#%% code
+BATCH_SIZE = 128
+NUM_WORKERS = 2 if IN_COLAB else 0
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                          num_workers=NUM_WORKERS, pin_memory=USE_AMP, drop_last=True)
+val_loader = DataLoader(val_ds, batch_size=256, shuffle=False,
+                        num_workers=NUM_WORKERS, pin_memory=USE_AMP)
+
+print(f'train loader: {len(train_loader)} batches of {BATCH_SIZE} (drop_last drops the partial one)')
+print(f'val   loader: {len(val_loader)} batches of 256, shuffle=False')
+
+xb, yb = next(iter(train_loader))
+print(f'\none batch: x {tuple(xb.shape)} {xb.dtype} | y {tuple(yb.shape)} {yb.dtype}')
+print('y must be int64 for CrossEntropyLoss:', yb.dtype == torch.int64)
+print(f'batch memory: {xb.element_size() * xb.nelement() / 1e6:.2f} MB')
+
+#%% md
+### Sanity check 1: look at a batch, after transforms
+
+The highest-value plot in deep learning. It catches label misalignment, wrong normalization,
+and broken augmentation in one glance. **Do this on every new dataset.**
+
+#%% code
+def denormalize(t, mean=CIFAR_MEAN, std=CIFAR_STD):
+    """CHW normalized tensor -> HWC array in 0..1, for display."""
+    m = torch.tensor(mean).view(-1, 1, 1)
+    s = torch.tensor(std).view(-1, 1, 1)
+    return (t.detach().cpu() * s + m).clamp(0, 1).permute(1, 2, 0).numpy()
+
+fig, axes = plt.subplots(3, 8, figsize=(13, 5.2))
+for ax, i in zip(axes.ravel(), range(24)):
+    ax.imshow(denormalize(xb[i]))
+    ax.set_title(CLASSES[yb[i]], fontsize=8)
+    ax.axis('off')
+plt.suptitle('a training batch, after augmentation + normalization (labels must match!)')
+plt.tight_layout()
+
+print('what to check:')
+print('  * do the labels match the pictures?           <- catches shuffled labels')
+print('  * do the colours look natural after denorm?   <- catches wrong mean/std')
+print('  * do you see crops/flips varying?             <- catches augmentation not applied')
+print(f'\nbatch stats: mean {xb.mean():+.3f} std {xb.std():.3f} (should be near 0 and 1)')
+print('per-channel mean:', xb.mean(dim=(0, 2, 3)).numpy().round(3))
+
+#%% code
+same_idx = 12
+fig, axes = plt.subplots(1, 8, figsize=(13, 2))
+raw = datasets.CIFAR10(DATA_DIR, train=True, transform=None)
+axes[0].imshow(raw[same_idx][0]); axes[0].set_title('raw', fontsize=9)
+for ax in axes[1:]:
+    ax.imshow(denormalize(train_tf(raw[same_idx][0]))); ax.set_title('augmented', fontsize=9)
+for ax in axes: ax.axis('off')
+plt.suptitle(f'ONE image ({CLASSES[raw[same_idx][1]]}), seven random augmentations - the label never changes')
+plt.tight_layout()
+print('The model sees a different tensor for this image every epoch. That is the whole point:')
+print('it can no longer memorise pixel patterns, so it has to learn the shape.')
+
+#%% md
+## 2. The model
+
+Chapter 3's `Conv-BN-ReLU` block, stacked. Channels double as spatial size halves.
+
+#%% code
+def conv_block(c_in, c_out, k=3):
+    return nn.Sequential(
+        nn.Conv2d(c_in, c_out, k, padding=k // 2, bias=False),   # bias=False: BN has its own shift
+        nn.BatchNorm2d(c_out),
+        nn.ReLU(inplace=True),
+    )
+
+class SmallCNN(nn.Module):
+    def __init__(self, n_classes=10, c_in=3, width=32, p_drop=0.2):
+        super().__init__()
+        w = width
+        self.stage1 = nn.Sequential(conv_block(c_in, w), conv_block(w, w), nn.MaxPool2d(2))
+        self.stage2 = nn.Sequential(conv_block(w, 2 * w), conv_block(2 * w, 2 * w), nn.MaxPool2d(2))
+        self.stage3 = nn.Sequential(conv_block(2 * w, 4 * w), conv_block(4 * w, 4 * w), nn.MaxPool2d(2))
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),      # (N, 4w, 4, 4) -> (N, 4w, 1, 1): size agnostic
+            nn.Flatten(),
+            nn.Dropout(p_drop),           # dropout only before the classifier
+            nn.Linear(4 * w, n_classes),
+        )
+
+    def forward(self, x):
+        return self.head(self.stage3(self.stage2(self.stage1(x))))
+
+
+model = SmallCNN().to(device)
+n_params = sum(p.numel() for p in model.parameters())
+print(f'parameters: {n_params:,}\n')
+
+h = torch.randn(2, 3, 32, 32, device=device)
+print('shape trace:')
+print(f'  input    {tuple(h.shape)}')
+for name in ['stage1', 'stage2', 'stage3']:
+    h = getattr(model, name)(h)
+    print(f'  {name}   {tuple(h.shape)}')
+print(f'  head     {tuple(model.head(h).shape)}  <- 10 logits per image')
+
+print('\nparameters per stage:')
+for name, mod in model.named_children():
+    print(f'  {name:8} {sum(p.numel() for p in mod.parameters()):9,d}')
+print('\nLate stages hold most of the PARAMETERS (channels are widest there).')
+print('Early stages cost most of the FLOPS (spatial maps are biggest there). Two different budgets.')
+
+#%% md
+## 3. Sanity checks before training
+
+### Check 2: the initial loss must be about ln(C)
+
+An untrained model should be maximally unsure: probability 1/10 per class, so cross-entropy
+`-ln(1/10) = ln(10) = 2.303`. A very different number means broken labels or initialization.
+
+#%% code
+criterion = nn.CrossEntropyLoss()
+fresh = SmallCNN().to(device)
+fresh.eval()
+with torch.no_grad():
+    xb_d, yb_d = xb.to(device), yb.to(device)
+    init_loss = criterion(fresh(xb_d), yb_d).item()
+
+print(f'expected initial loss ln(10) = {math.log(10):.4f}')
+print(f'measured              = {init_loss:.4f}')
+print('close enough:', abs(init_loss - math.log(10)) < 0.3)
+print('\nIf this were, say, 8.5, something is badly wrong: labels out of range, a bad')
+print('initialization, or an activation on the output. Two seconds, real information.')
+
+#%% md
+### Check 3: overfit one batch
+
+**The most valuable 30 seconds in deep learning.** Take 8 images, no augmentation, and train
+until the loss is ~0. A model that cannot memorise 8 examples has a bug, and no amount of
+hyperparameter tuning will fix it.
+
+#%% code
+set_seed(0)
+tiny_model = SmallCNN(p_drop=0.0).to(device)     # dropout OFF: this is a capacity check, not a
+tiny_opt = torch.optim.Adam(tiny_model.parameters(), lr=1e-3)   # generalization test, and dropout
+                                                                # noise would keep the floor above 0
+
+xs, ys = xb[:8].to(device), yb[:8].to(device)          # ONE fixed batch, reused every step
+tiny_model.train()
+losses = []
+t0 = time.perf_counter()
+for step in range(250):
+    tiny_opt.zero_grad(set_to_none=True)
+    loss = criterion(tiny_model(xs), ys)
+    loss.backward()
+    tiny_opt.step()
+    losses.append(loss.item())
+    if step % 50 == 0:
+        print(f'  step {step:4d}  loss {loss.item():.6f}')
+
+tiny_model.eval()
+with torch.no_grad():
+    acc = (tiny_model(xs).argmax(1) == ys).float().mean().item()
+print(f'\nfinal loss {losses[-1]:.2e} | accuracy on those 8 images {acc:.2f} | {time.perf_counter() - t0:.1f}s')
+assert losses[-1] < 0.01, 'could not overfit 8 samples -> there is a BUG, do not start training'
+print('PASSED. The pipeline is wired correctly: model, loss, labels, optimizer all agree.')
+
+plt.figure(figsize=(5.5, 3))
+plt.plot(losses); plt.yscale('log'); plt.xlabel('step'); plt.ylabel('loss (log)')
+plt.title('overfitting 8 samples: must go to ~0'); plt.grid(alpha=0.3)
+
+#%% md
+## 4. Train / evaluate functions
+
+Reusable, with mixed precision. Read the comments - each line is there for a reason.
+
+#%% code
+def make_scaler(enabled):
+    """GradScaler moved namespaces in torch 2.4; support both."""
+    try:
+        return torch.amp.GradScaler('cuda', enabled=enabled)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None, scheduler=None):
+    model.train()                                        # BatchNorm/Dropout in training mode
+    total_loss, correct, seen = 0.0, 0, 0
+    for xb, yb in loader:
+        xb = xb.to(device, non_blocking=True)
+        yb = yb.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)            # gradients accumulate otherwise
+        with torch.autocast(device_type=device.type, enabled=scaler is not None and scaler.is_enabled()):
+            logits = model(xb)
+            loss = criterion(logits, yb)
+
+        if scaler is not None and scaler.is_enabled():
+            scaler.scale(loss).backward()                # scale up so fp16 grads do not underflow
+            scaler.step(optimizer)                       # unscales, then steps (skips on inf/nan)
+            scaler.update()                              # adapt the scale factor
+        else:
+            loss.backward()
+            optimizer.step()
+
+        total_loss += loss.item() * yb.size(0)           # weight by batch size...
+        correct += (logits.argmax(1) == yb).sum().item()
+        seen += yb.size(0)
+    if scheduler is not None:
+        scheduler.step()
+    return total_loss / seen, correct / seen              # ...so the mean is over SAMPLES
+
+
+@torch.no_grad()
+def evaluate(model, loader, criterion, device, return_preds=False):
+    model.eval()                                         # running BN stats, dropout off
+    total_loss, correct, seen = 0.0, 0, 0
+    all_pred, all_true, all_prob = [], [], []
+    for xb, yb in loader:
+        xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+        logits = model(xb)
+        total_loss += criterion(logits, yb).item() * yb.size(0)
+        pred = logits.argmax(1)
+        correct += (pred == yb).sum().item()
+        seen += yb.size(0)
+        if return_preds:
+            all_pred.append(pred.cpu()); all_true.append(yb.cpu())
+            all_prob.append(torch.softmax(logits.float(), 1).cpu())
+    out = (total_loss / seen, correct / seen)
+    if return_preds:
+        out = out + (torch.cat(all_true).numpy(), torch.cat(all_pred).numpy(), torch.cat(all_prob).numpy())
+    return out
+
+print('defined train_one_epoch() and evaluate()')
+
+#%% md
+## 5. Train
+
+Optimizer choices worth noticing:
+
+- **SGD + Nesterov momentum** - still the best final accuracy on vision tasks.
+- **No weight decay on BatchNorm parameters or biases.** Decaying a normalization scale toward
+  zero makes no sense, and it measurably costs accuracy.
+- **Cosine annealing** - LR decays smoothly to ~0 over training. Almost always helps.
+
+#%% code
+EPOCHS = 15          # ~15s/epoch on a T4. Drop to 5 if you are impatient or on CPU.
+LR = 0.05
+WD = 5e-4
+
+set_seed(0)
+model = SmallCNN().to(device)
+
+decay, no_decay = [], []
+for name, p in model.named_parameters():
+    if not p.requires_grad:
+        continue
+    (no_decay if p.ndim <= 1 else decay).append(p)       # ndim<=1 -> biases and BN weights
+print(f'weight decay applied to {len(decay)} tensors, skipped for {len(no_decay)} (BN + biases)')
+
+optimizer = torch.optim.SGD(
+    [{'params': decay, 'weight_decay': WD},
+     {'params': no_decay, 'weight_decay': 0.0}],
+    lr=LR, momentum=0.9, nesterov=True)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+scaler = make_scaler(USE_AMP)
+criterion = nn.CrossEntropyLoss()
+
+print(f'\ntraining {EPOCHS} epochs, batch {BATCH_SIZE}, lr {LR} cosine-annealed, AMP {USE_AMP}')
+print(f'{"ep":>3} {"lr":>7} {"train_loss":>11} {"train_acc":>10} {"val_loss":>9} {"val_acc":>8} {"time":>7}')
+
+history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': [], 'lr': []}
+best_acc, t_start = 0.0, time.perf_counter()
+
+for epoch in range(EPOCHS):
+    t0 = time.perf_counter()
+    lr_now = optimizer.param_groups[0]['lr']
+    tr_loss, tr_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler, scheduler)
+    va_loss, va_acc = evaluate(model, val_loader, criterion, device)
+
+    for k, v in [('train_loss', tr_loss), ('train_acc', tr_acc), ('val_loss', va_loss),
+                 ('val_acc', va_acc), ('lr', lr_now)]:
+        history[k].append(v)
+
+    star = ''
+    if va_acc > best_acc:                                # keep the BEST, not the last
+        best_acc = va_acc
+        torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
+                    'epoch': epoch, 'val_acc': va_acc, 'classes': CLASSES},
+                   CKPT_DIR / 'best.pt')
+        star = ' *saved'
+    print(f'{epoch:3d} {lr_now:7.4f} {tr_loss:11.4f} {tr_acc:10.4f} {va_loss:9.4f} {va_acc:8.4f} '
+          f'{time.perf_counter() - t0:6.1f}s{star}')
+
+print(f'\ndone in {(time.perf_counter() - t_start) / 60:.1f} min | best val accuracy {best_acc:.4f}')
+print(f'checkpoint: {CKPT_DIR / "best.pt"}')
+
+#%% code
+fig, axes = plt.subplots(1, 3, figsize=(13, 3.6))
+axes[0].plot(history['train_loss'], marker='.', label='train')
+axes[0].plot(history['val_loss'], marker='.', label='val')
+axes[0].set_xlabel('epoch'); axes[0].set_ylabel('cross-entropy'); axes[0].set_title('loss')
+axes[1].plot(history['train_acc'], marker='.', label='train')
+axes[1].plot(history['val_acc'], marker='.', label='val')
+axes[1].axhline(best_acc, ls=':', c='k', label=f'best {best_acc:.3f}')
+axes[1].set_xlabel('epoch'); axes[1].set_ylabel('accuracy'); axes[1].set_title('accuracy')
+axes[2].plot(history['lr'], marker='.'); axes[2].set_xlabel('epoch'); axes[2].set_ylabel('lr')
+axes[2].set_title('cosine schedule')
+for ax in axes[:2]: ax.legend()
+for ax in axes: ax.grid(alpha=0.3)
+plt.tight_layout()
+
+gap = history['train_acc'][-1] - history['val_acc'][-1]
+print(f'final train acc {history["train_acc"][-1]:.4f} | val acc {history["val_acc"][-1]:.4f} | gap {gap:+.4f}')
+if gap > 0.10:
+    print('-> a large gap: overfitting. More augmentation, more weight decay, or stop earlier.')
+elif gap < 0.0:
+    print('-> val BETTER than train. Normal here: train accuracy is measured on augmented')
+    print('   (harder) images with dropout active, val on clean images with dropout off.')
+else:
+    print('-> healthy gap. Both still improving at the end means you could train longer.')
+
+#%% md
+## 6. Evaluate properly
+
+One accuracy number hides everything interesting.
+
+#%% code
+va_loss, va_acc, y_true, y_pred, y_prob = evaluate(model, val_loader, criterion, device, return_preds=True)
+
+def confusion_matrix(y_true, y_pred, k):
+    return np.bincount(y_true.astype(np.int64) * k + y_pred.astype(np.int64), minlength=k * k).reshape(k, k)
+
+cm = confusion_matrix(y_true, y_pred, len(CLASSES))
+recall = np.diag(cm) / cm.sum(1)
+precision = np.diag(cm) / np.maximum(cm.sum(0), 1)
+f1 = 2 * precision * recall / np.maximum(precision + recall, 1e-9)
+
+print(f'overall accuracy {va_acc:.4f}  (loss {va_loss:.4f})\n')
+print(f'{"class":12} {"recall":>7} {"precis":>7} {"f1":>7} {"support":>8}')
+for i, c in enumerate(CLASSES):
+    print(f'{c:12} {recall[i]:7.3f} {precision[i]:7.3f} {f1[i]:7.3f} {cm[i].sum():8d}')
+print(f'\n{"macro avg":12} {recall.mean():7.3f} {precision.mean():7.3f} {f1.mean():7.3f}')
+print(f'\nbest  class: {CLASSES[recall.argmax()]} ({recall.max():.3f})')
+print(f'worst class: {CLASSES[recall.argmin()]} ({recall.min():.3f})')
+
+off = cm.copy(); np.fill_diagonal(off, 0)
+pairs = np.dstack(np.unravel_index(np.argsort(-off.ravel()), off.shape))[0][:5]
+print('\ntop confusions:')
+for i, j in pairs:
+    print(f'  true {CLASSES[i]:12} predicted as {CLASSES[j]:12} {off[i, j]:4d} times')
+
+#%% code
+fig, axes = plt.subplots(1, 2, figsize=(13, 5.2))
+axes[0].imshow(cm, cmap='Blues')
+axes[0].set_title('confusion matrix (counts)')
+norm_cm = cm / cm.sum(1, keepdims=True)
+im = axes[1].imshow(norm_cm, cmap='Blues', vmin=0, vmax=1)
+axes[1].set_title('row-normalized: the diagonal IS per-class recall')
+for ax in axes:
+    ax.set_xticks(range(10)); ax.set_yticks(range(10))
+    ax.set_xticklabels(CLASSES, rotation=45, ha='right', fontsize=8)
+    ax.set_yticklabels(CLASSES, fontsize=8)
+    ax.set_xlabel('predicted'); ax.set_ylabel('actual')
+for i in range(10):
+    for j in range(10):
+        if norm_cm[i, j] > 0.02:
+            axes[1].text(j, i, f'{norm_cm[i, j]:.2f}', ha='center', va='center', fontsize=6,
+                         color='white' if norm_cm[i, j] > 0.5 else 'black')
+fig.colorbar(im, ax=axes[1], shrink=0.8)
+plt.tight_layout()
+print('Animals confuse with animals, vehicles with vehicles. cat<->dog is almost always the')
+print('worst pair on CIFAR-10 - the classes genuinely overlap at 32x32.')
+
+#%% code
+val_raw = datasets.CIFAR10(DATA_DIR, train=False, transform=None)
+wrong = np.where(y_pred != y_true)[0]
+conf_wrong = y_prob[wrong].max(1)
+order = wrong[np.argsort(-conf_wrong)]
+
+print(f'{len(wrong)} mistakes out of {len(y_true)} ({100 * len(wrong) / len(y_true):.1f}%)')
+fig, axes = plt.subplots(2, 8, figsize=(13, 4))
+for ax, idx in zip(axes.ravel(), order[:16]):
+    ax.imshow(val_raw[idx][0])
+    ax.set_title(f'true {CLASSES[y_true[idx]]}\npred {CLASSES[y_pred[idx]]} {y_prob[idx].max():.2f}', fontsize=7)
+    ax.axis('off')
+plt.suptitle('the most CONFIDENT mistakes - look at these on every project')
+plt.tight_layout()
+print('\nSome of these are genuinely ambiguous or mislabeled. That is information: it tells you')
+print('where your accuracy ceiling is, and whether the next win is in the model or in the data.')
+
+#%% code
+print('is the model calibrated? (when it says 90%, is it right 90% of the time?)\n')
+conf = y_prob.max(1)
+correct = (y_pred == y_true).astype(float)
+bins = np.linspace(0, 1, 11)
+idx = np.clip(np.digitize(conf, bins) - 1, 0, 9)      # clip so confidence exactly 1.0 lands in the last bin
+print(f'{"confidence bin":>16} {"count":>7} {"avg conf":>9} {"accuracy":>9} {"gap":>7}')
+xs, ys_acc, ys_conf = [], [], []
+for b in range(10):
+    m = idx == b
+    if m.sum() < 10:
+        continue
+    print(f'{f"{bins[b]:.1f}-{bins[b + 1]:.1f}":>16} {m.sum():7d} {conf[m].mean():9.3f} '
+          f'{correct[m].mean():9.3f} {conf[m].mean() - correct[m].mean():+7.3f}')
+    xs.append(conf[m].mean()); ys_acc.append(correct[m].mean())
+ece = float(np.sum([np.mean(idx == b) * abs(correct[idx == b].mean() - conf[idx == b].mean())
+                    for b in range(10) if (idx == b).sum() >= 10]))
+print(f'\nexpected calibration error {ece:.4f}')
+
+plt.figure(figsize=(4.4, 4))
+plt.plot([0, 1], [0, 1], 'k--', label='perfect calibration')
+plt.plot(xs, ys_acc, 'o-', label='this model')
+plt.xlabel('mean predicted confidence'); plt.ylabel('actual accuracy')
+plt.legend(); plt.grid(alpha=0.3); plt.title('reliability diagram')
+print('Below the diagonal = overconfident, which is the normal failure mode of modern nets.')
+print('Fixes: label smoothing during training, or temperature scaling on a held-out split.')
+
+#%% md
+## 7. Test-time augmentation
+
+Average the predictions over an image and its mirror. Usually buys a few tenths of a percent
+for 2x the inference cost - and it costs nothing to try.
+
+#%% code
+@torch.no_grad()
+def evaluate_tta(model, loader, device):
+    model.eval()
+    correct, seen = 0, 0
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        p = torch.softmax(model(xb).float(), 1) + torch.softmax(model(torch.flip(xb, dims=[3])).float(), 1)
+        correct += (p.argmax(1) == yb).sum().item()
+        seen += yb.size(0)
+    return correct / seen
+
+acc_plain = evaluate(model, val_loader, criterion, device)[1]
+t0 = time.perf_counter(); acc_tta = evaluate_tta(model, val_loader, device); t_tta = time.perf_counter() - t0
+print(f'plain accuracy {acc_plain:.4f}')
+print(f'TTA accuracy   {acc_tta:.4f}  ({acc_tta - acc_plain:+.4f}) in {t_tta:.1f}s')
+print('\nflip TTA is valid here because horizontal flip is a label-preserving transform for')
+print('CIFAR-10. It would be WRONG for text or digits, where a mirrored 2 is not a 2.')
+
+#%% md
+## 8. Does augmentation actually help? An ablation
+
+Claims are cheap. Train the same model for a few epochs with and without augmentation and
+look at the gap.
+
+#%% code
+ABLATION_EPOCHS = 6
+
+def quick_train(transform, epochs=ABLATION_EPOCHS, label=''):
+    ds = datasets.CIFAR10(DATA_DIR, train=True, transform=transform)
+    loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS,
+                        pin_memory=USE_AMP, drop_last=True)
+    set_seed(0)
+    m = SmallCNN().to(device)
+    opt = torch.optim.SGD(m.parameters(), lr=LR, momentum=0.9, nesterov=True, weight_decay=WD)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    sc = make_scaler(USE_AMP)
+    hist = {'train_acc': [], 'val_acc': []}
+    for ep in range(epochs):
+        tr_loss, tr_acc = train_one_epoch(m, loader, criterion, opt, device, sc, sch)
+        va_loss, va_acc = evaluate(m, val_loader, criterion, device)
+        hist['train_acc'].append(tr_acc); hist['val_acc'].append(va_acc)
+        print(f'  {label:12} epoch {ep}: train {tr_acc:.4f} val {va_acc:.4f}')
+    return hist
+
+print(f'training {ABLATION_EPOCHS} epochs each, identical seed and hyperparameters')
+print('\nwithout augmentation:')
+hist_none = quick_train(eval_tf, label='no aug')
+print('\nwith augmentation:')
+hist_aug = quick_train(train_tf, label='crop+flip')
+
+plt.figure(figsize=(6, 3.8))
+plt.plot(hist_none['train_acc'], 'C0--', marker='.', label='no aug: train')
+plt.plot(hist_none['val_acc'], 'C0-', marker='o', label='no aug: val')
+plt.plot(hist_aug['train_acc'], 'C1--', marker='.', label='aug: train')
+plt.plot(hist_aug['val_acc'], 'C1-', marker='o', label='aug: val')
+plt.xlabel('epoch'); plt.ylabel('accuracy'); plt.legend(fontsize=8); plt.grid(alpha=0.3)
+plt.title(f'augmentation ablation ({ABLATION_EPOCHS} epochs)')
+
+print(f'\nno augmentation: train {hist_none["train_acc"][-1]:.4f}  val {hist_none["val_acc"][-1]:.4f}'
+      f'  gap {hist_none["train_acc"][-1] - hist_none["val_acc"][-1]:+.4f}')
+print(f'augmentation   : train {hist_aug["train_acc"][-1]:.4f}  val {hist_aug["val_acc"][-1]:.4f}'
+      f'  gap {hist_aug["train_acc"][-1] - hist_aug["val_acc"][-1]:+.4f}')
+print(f'\nval accuracy delta from augmentation: {hist_aug["val_acc"][-1] - hist_none["val_acc"][-1]:+.4f}')
+print('Note the train-val GAP, not just the accuracy: without augmentation the model fits the')
+print('training set much faster and generalizes worse. Two random crops and a flip - free accuracy.')
+
+#%% md
+## 9. Save and load a checkpoint
+
+Save the `state_dict`, never the model object. And on Colab, save somewhere that survives a
+disconnect.
+
+#%% code
+ckpt = torch.load(CKPT_DIR / 'best.pt', map_location=device, weights_only=False)
+print('checkpoint keys:', list(ckpt.keys()))
+print(f'saved at epoch {ckpt["epoch"]} with val accuracy {ckpt["val_acc"]:.4f}')
+
+restored = SmallCNN().to(device)
+restored.load_state_dict(ckpt['model'])
+acc_restored = evaluate(restored, val_loader, criterion, device)[1]
+print(f'\nreloaded model accuracy {acc_restored:.4f} == saved {ckpt["val_acc"]:.4f}:',
+      abs(acc_restored - ckpt['val_acc']) < 1e-6)
+
+print('\nto keep it across Colab sessions, write to Drive:')
+print("    from google.colab import drive; drive.mount('/content/drive')")
+print("    torch.save(state, '/content/drive/MyDrive/cv_bootcamp/best.pt')")
+print('\n/content is wiped when the runtime disconnects. Drive is not.')
+
+with open(CKPT_DIR / 'history.json', 'w') as f:
+    json.dump(history, f)
+print(f'\nhistory saved to {CKPT_DIR / "history.json"} - keep these, you will want to compare runs')
+
+#%% md
+## What to remember
+
+**The order in which you should spend effort:**
+
+1. Get the pipeline correct (look at a batch, overfit one batch). *Correctness before speed.*
+2. Tune the learning rate. It dominates everything else.
+3. Add augmentation.
+4. Train longer with a cosine schedule.
+5. *Only then* consider a bigger or different architecture.
+
+| Idea | The one-liner |
+|---|---|
+| `Dataset` | `__len__` + `__getitem__` returning `(tensor, int64 label)` |
+| `DataLoader` | batching, `shuffle=True` for train only, `num_workers` for parallel decode |
+| Transforms | augmentation train-only; preprocessing identical on both |
+| Sanity check 1 | plot a batch after transforms, with labels |
+| Sanity check 2 | initial loss should be `ln(C)` |
+| Sanity check 3 | **overfit 8 samples to ~0 loss** before you train for real |
+| The loop | zero_grad -> forward -> loss -> backward -> step; `train()`/`eval()` |
+| Running loss | weight by batch size, use `.item()` |
+| AMP | `autocast` + `GradScaler` = ~2x faster, half the memory, free |
+| Optimizer | SGD + nesterov momentum + cosine schedule; no weight decay on BN/bias |
+| Checkpoints | save `state_dict`, keep the **best** by val metric, put it on Drive |
+| Evaluation | confusion matrix, per-class recall, confident mistakes, calibration |
+| Augmentation | watch the train-val *gap*, not just accuracy |
+
+Now do [`exercises/ex04_cnn.ipynb`](../exercises/ex04_cnn.ipynb). Chapter 5 gets a better
+result than this in a fraction of the time, by not starting from scratch.

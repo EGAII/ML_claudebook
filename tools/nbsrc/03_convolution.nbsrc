@@ -1,0 +1,671 @@
+#out notebooks/03_convolution_image_ops.ipynb
+#gpu off
+
+#%% md
+# Chapter 3 - Convolution and image operations
+
+Companion to [`docs/03_convolution.md`](../docs/03_convolution.md). **CPU is fine.**
+
+We build convolution three times, in increasing order of realism:
+
+1. **Naive loops** - the definition, slowly.
+2. **`sliding_window_view` + `einsum`** - the vectorized form (this is `im2col`, which is what
+   your GPU actually does).
+3. **`F.conv2d`** - the real thing, and we check all three agree to floating-point precision.
+
+Then: the classic kernels, the output-size formula, pooling, receptive fields measured
+empirically with autograd, and a proof that convolution is translation-equivariant while a
+linear layer is not.
+
+#%% code
+import sys, time
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+print('numpy', np.__version__, '| torch', torch.__version__)
+plt.rcParams['figure.dpi'] = 110
+plt.rcParams['image.cmap'] = 'gray'
+rng = np.random.default_rng(0)
+torch.manual_seed(0)
+
+#%% md
+## 0. A test image
+
+matplotlib ships a real photograph, so we get genuine texture and edges with no download. If
+it's missing we fall back to a synthetic pattern - defensive data loading is a habit worth
+having.
+
+#%% code
+def load_test_image(size=192):
+    """(H, W) float32 grayscale in 0..1."""
+    try:
+        import matplotlib.cbook as cbook
+        from PIL import Image
+        with cbook.get_sample_data('grace_hopper.jpg') as f:
+            im = Image.open(f).convert('L').resize((size, size), Image.BILINEAR)
+        return np.asarray(im, dtype=np.float32) / 255.0, 'photo'
+    except Exception as e:
+        print('sample photo unavailable, using a synthetic pattern:', type(e).__name__)
+        from PIL import Image, ImageDraw
+        im = Image.new('L', (size, size), 30)
+        d = ImageDraw.Draw(im)
+        d.ellipse([20, 20, 90, 90], fill=220)
+        d.rectangle([110, 30, 170, 100], fill=140)
+        d.polygon([(50, 170), (20, 115), (95, 115)], fill=90)
+        for x in range(110, 175, 8):
+            d.line([(x, 120), (x, 170)], fill=240, width=3)
+        return np.asarray(im, dtype=np.float32) / 255.0, 'synthetic'
+
+img, src = load_test_image()
+print(f'test image: {img.shape} {img.dtype} range ({img.min():.2f}, {img.max():.2f}) source={src}')
+
+fig, axes = plt.subplots(1, 3, figsize=(9, 3))
+axes[0].imshow(img); axes[0].set_title('test image')
+axes[1].imshow(img[40:90, 60:110]); axes[1].set_title('a 50x50 crop')
+axes[2].hist(img.ravel(), bins=50); axes[2].set_title('intensity histogram')
+axes[0].axis('off'); axes[1].axis('off')
+plt.tight_layout()
+
+#%% md
+## 1. Convolution by definition
+
+Slide a kernel, multiply elementwise, sum. That's the whole operation.
+
+$$\text{out}[i,j] = \sum_m \sum_n \text{in}[i+m,\, j+n] \cdot K[m,n]$$
+
+#%% code
+def conv2d_naive(x, kernel, stride=1, padding=0):
+    """Single-channel 2D cross-correlation, written out with loops. Slow on purpose."""
+    k = kernel.shape[0]
+    assert kernel.shape[0] == kernel.shape[1], 'square kernels only, for clarity'
+    xp = np.pad(x, ((padding, padding), (padding, padding)), mode='constant')
+    H, W = xp.shape
+    out_h = (H - k) // stride + 1
+    out_w = (W - k) // stride + 1
+    out = np.zeros((out_h, out_w), dtype=np.float32)
+    for i in range(out_h):
+        for j in range(out_w):
+            patch = xp[i * stride:i * stride + k, j * stride:j * stride + k]
+            out[i, j] = np.sum(patch * kernel)          # multiply and add: the whole idea
+    return out
+
+
+tiny = np.arange(25, dtype=np.float32).reshape(5, 5)
+identity_k = np.array([[0, 0, 0], [0, 1, 0], [0, 0, 0]], dtype=np.float32)
+mean_k = np.ones((3, 3), dtype=np.float32) / 9
+
+print('input\n', tiny.astype(int))
+print('\nidentity kernel, no padding -> just the interior, 3x3:\n', conv2d_naive(tiny, identity_k).astype(int))
+print('\nmean kernel, padding=1 -> same size, borders pulled toward 0 by the zero padding:')
+print(np.round(conv2d_naive(tiny, mean_k, padding=1), 1))
+print('\ninterior value 12 = mean of the 3x3 block around it =', tiny[1:4, 1:4].mean())
+
+#%% md
+## 2. The output size formula
+
+$$H_{out} = \left\lfloor \frac{H_{in} + 2p - d(k-1) - 1}{s} \right\rfloor + 1$$
+
+Learn it once; you'll use it every time you design a network. Let's verify it against
+`F.conv2d` for a spread of settings - including the awkward ones where the kernel doesn't tile
+the input evenly and the floor silently discards a row.
+
+#%% code
+def conv_out_size(in_size, k, stride=1, padding=0, dilation=1):
+    return (in_size + 2 * padding - dilation * (k - 1) - 1) // stride + 1
+
+
+print(f'{"in":>4} {"k":>3} {"s":>3} {"p":>3} {"d":>3} {"formula":>8} {"F.conv2d":>9}  note')
+cases = [(32, 3, 1, 1, 1, 'size preserved - the default block'),
+         (32, 3, 1, 0, 1, 'no padding: loses 1 px each side'),
+         (32, 5, 1, 2, 1, 'k=5 preserved with p=(k-1)/2'),
+         (32, 3, 2, 1, 1, 'halves the size - strided downsample'),
+         (32, 2, 2, 0, 1, 'halves it - max-pool geometry'),
+         (32, 1, 1, 0, 1, '1x1: channels only, space untouched'),
+         (32, 7, 2, 3, 1, 'ResNet stem'),
+         (32, 3, 1, 2, 2, 'dilation 2: 5x5 reach, 9 weights'),
+         (31, 3, 2, 0, 1, 'odd input + stride: floor drops a row')]
+for in_size, k, s, p, d, note in cases:
+    formula = conv_out_size(in_size, k, s, p, d)
+    with torch.no_grad():
+        actual = F.conv2d(torch.zeros(1, 1, in_size, in_size),
+                          torch.zeros(1, 1, k, k), stride=s, padding=p, dilation=d).shape[-1]
+    flag = 'OK' if formula == actual else 'MISMATCH'
+    print(f'{in_size:4d} {k:3d} {s:3d} {p:3d} {d:3d} {formula:8d} {actual:9d}  {flag}: {note}')
+    assert formula == actual
+
+print('\nRule of thumb: odd k with p = (k-1)//2 always preserves size at stride 1.')
+
+#%% md
+## 3. The classic kernels
+
+Hand-designed filters, from before CNNs. A network's first layer learns something very close
+to these on its own - which is a reassuring sign the idea is sound.
+
+Watch the **kernel sums**: sum 1 preserves brightness (blur), sum 0 responds only to change
+(edges), which is why edge maps are mostly black.
+
+#%% code
+KERNELS = {
+    'identity':   np.array([[0, 0, 0], [0, 1, 0], [0, 0, 0]], dtype=np.float32),
+    'box blur':   np.ones((3, 3), np.float32) / 9,
+    'gaussian':   np.array([[1, 2, 1], [2, 4, 2], [1, 2, 1]], np.float32) / 16,
+    'sobel x':    np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], np.float32),
+    'sobel y':    np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], np.float32),
+    'laplacian':  np.array([[0, -1, 0], [-1, 4, -1], [0, -1, 0]], np.float32),
+    'sharpen':    np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], np.float32),
+    'emboss':     np.array([[-2, -1, 0], [-1, 1, 1], [0, 1, 2]], np.float32),
+}
+
+print(f'{"kernel":12} {"sum":>7}  interpretation')
+for name, k in KERNELS.items():
+    s = float(k.sum())
+    kind = 'preserves brightness' if abs(s - 1) < 1e-6 else ('responds to change only' if abs(s) < 1e-6 else f'scales brightness by {s:g}')
+    print(f'{name:12} {s:7.3f}  {kind}')
+
+fig, axes = plt.subplots(2, 4, figsize=(12, 6))
+for ax, (name, k) in zip(axes.ravel(), KERNELS.items()):
+    out = conv2d_naive(img, k, padding=1)
+    if k.sum() == 0:
+        ax.imshow(np.abs(out), vmin=0, vmax=np.abs(out).max())      # edges: show magnitude
+    else:
+        ax.imshow(np.clip(out, 0, 1))
+    ax.set_title(f'{name}  (sum={k.sum():g})', fontsize=9)
+    ax.axis('off')
+plt.suptitle('the same image through eight kernels')
+plt.tight_layout()
+
+#%% code
+gx = conv2d_naive(img, KERNELS['sobel x'], padding=1)
+gy = conv2d_naive(img, KERNELS['sobel y'], padding=1)
+mag = np.sqrt(gx ** 2 + gy ** 2)
+ang = np.arctan2(gy, gx)
+
+fig, axes = plt.subplots(1, 5, figsize=(14, 3))
+axes[0].imshow(img); axes[0].set_title('input')
+axes[1].imshow(gx, cmap='RdBu_r'); axes[1].set_title('Gx (vertical edges)')
+axes[2].imshow(gy, cmap='RdBu_r'); axes[2].set_title('Gy (horizontal edges)')
+axes[3].imshow(mag); axes[3].set_title('magnitude sqrt(Gx^2+Gy^2)')
+axes[4].imshow(np.where(mag > 0.5 * mag.max(), 1.0, 0.0)); axes[4].set_title('thresholded')
+for ax in axes: ax.axis('off')
+plt.tight_layout()
+
+print('Gx is signed: red = bright-to-dark, blue = dark-to-bright. That sign carries orientation.')
+print('The magnitude is orientation-free edge strength - the basis of Canny, HOG and SIFT.')
+print(f'\nedge pixels above half-max: {(mag > 0.5 * mag.max()).mean() * 100:.1f}% of the image')
+
+#%% md
+## 4. Vectorizing it: `im2col`
+
+The loop version is the definition; nobody computes it that way. Instead, extract every patch
+as a row and do **one matrix multiply**. `sliding_window_view` gives us the patches as a view
+(no copy), and `einsum` does the contraction.
+
+#%% code
+from numpy.lib.stride_tricks import sliding_window_view
+
+def conv2d_im2col(x, kernel, stride=1, padding=0):
+    """Same result as conv2d_naive, expressed as one tensor contraction."""
+    k = kernel.shape[0]
+    xp = np.pad(x, ((padding, padding), (padding, padding)))
+    windows = sliding_window_view(xp, (k, k))        # (H-k+1, W-k+1, k, k) - a VIEW
+    windows = windows[::stride, ::stride]
+    return np.einsum('hwmn,mn->hw', windows, kernel).astype(np.float32)
+
+
+padded = np.pad(img, 1)
+w = sliding_window_view(padded, (3, 3))
+print('image', img.shape, '-> windows', w.shape, '= (out_h, out_w, k, k)')
+print('windows is a VIEW, no data copied:', np.shares_memory(w, padded))
+print(f'but its logical size is {w.nbytes / 1e6:.2f} MB vs {img.nbytes / 1e6:.2f} MB for the image')
+print(f'-> a real im2col materialises that {w.nbytes / img.nbytes:.0f}x expansion to get one big GEMM.')
+print('   Memory traded for speed. That is the trade GPUs are built around.\n')
+
+for name in ['gaussian', 'sobel x', 'laplacian']:
+    a = conv2d_naive(img, KERNELS[name], padding=1)
+    b = conv2d_im2col(img, KERNELS[name], padding=1)
+    print(f'{name:10} naive == im2col: {np.allclose(a, b, atol=1e-5)}  max diff {np.abs(a - b).max():.2e}')
+
+#%% code
+def to_torch(x):
+    return torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32))
+
+k_np = KERNELS['sobel x']
+x_t = to_torch(img)[None, None]                    # (1, 1, H, W) - NCHW
+w_t = to_torch(k_np)[None, None]                   # (1, 1, 3, 3) - (C_out, C_in, kh, kw)
+with torch.no_grad():
+    torch_out = F.conv2d(x_t, w_t, padding=1)[0, 0].numpy()
+
+naive_out = conv2d_naive(img, k_np, padding=1)
+print('naive vs F.conv2d      :', np.allclose(naive_out, torch_out, atol=1e-4), f'max diff {np.abs(naive_out - torch_out).max():.2e}')
+
+try:
+    from scipy.signal import correlate2d, convolve2d
+    sci_corr = correlate2d(img, k_np, mode='same')
+    sci_conv = convolve2d(img, k_np, mode='same')
+    print('naive vs scipy correlate2d:', np.allclose(naive_out, sci_corr, atol=1e-4), ' <- matches')
+    print('naive vs scipy convolve2d :', np.allclose(naive_out, sci_conv, atol=1e-4), ' <- does NOT match')
+    print('\nBecause true convolution FLIPS the kernel first. Deep learning "convolution" is')
+    print('cross-correlation. It makes no difference for learned kernels, but it does when you')
+    print('compare against a signal-processing library. correlate2d is the one that matches.')
+    print('flipped kernel through convolve2d matches naive:',
+          np.allclose(naive_out, convolve2d(img, np.flip(k_np), mode='same'), atol=1e-4))
+except ImportError:
+    print('(scipy not available - skipping the flip demonstration)')
+
+#%% code
+big = rng.random((512, 512)).astype(np.float32)
+kern = KERNELS['gaussian']
+
+t0 = time.perf_counter(); _ = conv2d_naive(big, kern, padding=1); t_naive = time.perf_counter() - t0
+t0 = time.perf_counter(); _ = conv2d_im2col(big, kern, padding=1); t_im2col = time.perf_counter() - t0
+bt, bw = to_torch(big)[None, None], to_torch(kern)[None, None]
+with torch.no_grad():
+    _ = F.conv2d(bt, bw, padding=1)                              # warm up
+    t0 = time.perf_counter(); _ = F.conv2d(bt, bw, padding=1); t_torch = time.perf_counter() - t0
+
+print(f'512x512, 3x3 kernel:')
+print(f'  naive loops   {t_naive * 1000:9.2f} ms   1x')
+print(f'  im2col+einsum {t_im2col * 1000:9.2f} ms   {t_naive / t_im2col:.0f}x faster')
+print(f'  F.conv2d      {t_torch * 1000:9.2f} ms   {t_naive / t_torch:.0f}x faster')
+print('\nSame arithmetic, three orders of magnitude. On a GPU, add another one or two.')
+
+#%% md
+## 5. Padding, stride, dilation - visually
+
+#%% code
+small = img[::4, ::4]                       # 48x48, so the effects are easy to see
+fig, axes = plt.subplots(1, 5, figsize=(14, 3))
+axes[0].imshow(small); axes[0].set_title(f'input {small.shape}')
+for ax, (p, s, d, label) in zip(axes[1:], [(0, 1, 1, 'p=0 s=1'), (1, 1, 1, 'p=1 s=1'),
+                                           (1, 2, 1, 'p=1 s=2'), (2, 1, 2, 'p=2 s=2 dilated')]):
+    with torch.no_grad():
+        o = F.conv2d(to_torch(small)[None, None], to_torch(KERNELS['laplacian'])[None, None],
+                     stride=s, padding=p, dilation=d)[0, 0].numpy()
+    ax.imshow(np.abs(o)); ax.set_title(f'{label}\n-> {o.shape}', fontsize=9)
+for ax in axes: ax.axis('off')
+plt.tight_layout()
+
+print('padding modes change what happens at the border:')
+xb = to_torch(small)[None, None]
+for mode in ['constant', 'reflect', 'replicate', 'circular']:
+    padded = F.pad(xb, (2, 2, 2, 2), mode=mode)
+    print(f'  {mode:10} -> {tuple(padded.shape)}  top-left corner value {padded[0, 0, 0, 0].item():.3f}')
+
+fig, axes = plt.subplots(1, 4, figsize=(11, 3))
+for ax, mode in zip(axes, ['constant', 'reflect', 'replicate', 'circular']):
+    ax.imshow(F.pad(xb, (12, 12, 12, 12), mode=mode)[0, 0].numpy())
+    ax.set_title(f'pad mode: {mode}', fontsize=9); ax.axis('off')
+plt.suptitle('zero padding darkens borders; reflect/replicate do not')
+plt.tight_layout()
+
+#%% md
+## 6. Channels: the 4D weight tensor
+
+`Conv2d(C_in, C_out, k)` has weights of shape `(C_out, C_in, k, k)`. **Each filter spans all
+input channels** and produces exactly one output channel.
+
+$$\text{params} = C_{out} \times C_{in} \times k \times k + C_{out}$$
+
+#%% code
+def conv_params(c_in, c_out, k, bias=True, groups=1):
+    return c_out * (c_in // groups) * k * k + (c_out if bias else 0)
+
+
+print(f'{"layer":38} {"weight shape":>22} {"params":>10} {"formula":>10}')
+for c_in, c_out, k, note in [(3, 16, 3, 'first layer of a small CNN'),
+                             (3, 64, 7, 'ResNet stem'),
+                             (64, 64, 3, 'a typical middle layer'),
+                             (64, 128, 3, 'channel doubling'),
+                             (512, 512, 3, 'a late VGG layer'),
+                             (512, 128, 1, '1x1 bottleneck')]:
+    layer = nn.Conv2d(c_in, c_out, k)
+    actual = sum(p.numel() for p in layer.parameters())
+    print(f'Conv2d({c_in:3d},{c_out:4d}, k={k})  {note:16} {str(tuple(layer.weight.shape)):>22} {actual:10,d} {conv_params(c_in, c_out, k):10,d}')
+    assert actual == conv_params(c_in, c_out, k)
+
+print('\nand the comparison that justifies the whole field:')
+fc = nn.Linear(3 * 32 * 32, 16 * 32 * 32)
+cv = nn.Conv2d(3, 16, 3, padding=1)
+n_fc = sum(p.numel() for p in fc.parameters())
+n_cv = sum(p.numel() for p in cv.parameters())
+print(f'  fully connected 3x32x32 -> 16x32x32 : {n_fc:12,d} parameters')
+print(f'  Conv2d(3, 16, 3, padding=1)         : {n_cv:12,d} parameters')
+print(f'  ratio: {n_fc / n_cv:,.0f}x fewer, and the conv generalizes BETTER')
+
+#%% code
+rgb = np.stack([img, np.roll(img, 6, axis=1), np.roll(img, -6, axis=0)])     # fake 3-channel
+print('input', rgb.shape, '(C, H, W)')
+
+weight = torch.stack([
+    to_torch(KERNELS['sobel x'])[None].repeat(3, 1, 1),      # filter 0: sobel x on all channels
+    to_torch(KERNELS['gaussian'])[None].repeat(3, 1, 1),     # filter 1: blur on all channels
+])
+print('weight', tuple(weight.shape), '= (C_out=2, C_in=3, 3, 3)')
+
+with torch.no_grad():
+    out = F.conv2d(to_torch(rgb)[None], weight, padding=1)
+print('output', tuple(out.shape), '-> 2 channels, one per filter, each a SUM over the 3 inputs')
+
+fig, axes = plt.subplots(1, 5, figsize=(13, 2.8))
+for i in range(3):
+    axes[i].imshow(rgb[i]); axes[i].set_title(f'input ch {i}', fontsize=9)
+axes[3].imshow(np.abs(out[0, 0].numpy())); axes[3].set_title('out ch 0 (sobel, summed)', fontsize=9)
+axes[4].imshow(out[0, 1].numpy()); axes[4].set_title('out ch 1 (blur, summed)', fontsize=9)
+for ax in axes: ax.axis('off')
+plt.tight_layout()
+
+print('\n1x1 convolution = a per-pixel linear layer across channels:')
+with torch.no_grad():
+    mix = F.conv2d(to_torch(rgb)[None], torch.tensor([[[[0.299]], [[0.587]], [[0.114]]]]))
+print('  (1,3,H,W) with weight (1,3,1,1) ->', tuple(mix.shape), '- that weight is the RGB->gray formula')
+
+print('\ndepthwise (groups=C_in): each channel gets its own kernel, no mixing')
+print('  Conv2d(64, 64, 3)             params:', conv_params(64, 64, 3))
+print('  Conv2d(64, 64, 3, groups=64)  params:', conv_params(64, 64, 3, groups=64), '<- depthwise')
+print('  + Conv2d(64, 64, 1)           params:', conv_params(64, 64, 1))
+print(f'  depthwise separable total: {conv_params(64, 64, 3, groups=64) + conv_params(64, 64, 1)} vs {conv_params(64, 64, 3)}'
+      f' = {conv_params(64, 64, 3) / (conv_params(64, 64, 3, groups=64) + conv_params(64, 64, 1)):.1f}x cheaper')
+print('  This substitution is what makes MobileNet small enough for a phone.')
+
+#%% md
+## 7. Pooling
+
+Max pool 2x2 stride 2: quarter the spatial size, same channels, **zero parameters**.
+
+#%% code
+xp = to_torch(img)[None, None]
+with torch.no_grad():
+    mx = F.max_pool2d(xp, 2)
+    av = F.avg_pool2d(xp, 2)
+    mx4 = F.max_pool2d(xp, 4)
+    gap = F.adaptive_avg_pool2d(xp, 1)
+
+print('input           ', tuple(xp.shape))
+print('max_pool2d(2)   ', tuple(mx.shape), '- half the size, quarter the pixels')
+print('avg_pool2d(2)   ', tuple(av.shape))
+print('max_pool2d(4)   ', tuple(mx4.shape))
+print('adaptive_avg(1) ', tuple(gap.shape), '= global average pooling, value', round(gap.item(), 4))
+print('                  (equals the image mean:', round(float(img.mean()), 4), ')')
+
+fig, axes = plt.subplots(1, 5, figsize=(13, 2.8))
+for ax, (im, t) in zip(axes, [(img, f'input {img.shape}'), (mx[0, 0].numpy(), 'max 2x2'),
+                              (av[0, 0].numpy(), 'avg 2x2'), (mx4[0, 0].numpy(), 'max 4x4'),
+                              (np.abs(mx[0, 0].numpy() - av[0, 0].numpy()), '|max - avg|')]):
+    ax.imshow(im); ax.set_title(t, fontsize=9); ax.axis('off')
+plt.tight_layout()
+print('\nmax keeps the brightest response (edges survive); avg smooths.')
+print('The difference image is largest exactly at the high-contrast texture.')
+
+#%% code
+print('max pooling gives small-shift tolerance:')
+patch = np.zeros((8, 8), dtype=np.float32); patch[2, 2] = 1.0
+for shift in range(3):
+    p = np.roll(patch, shift, axis=1)
+    with torch.no_grad():
+        pooled = F.max_pool2d(to_torch(p)[None, None], 2)[0, 0].numpy()
+    print(f'  bright pixel at column {2 + shift}: pooled map nonzero at {np.argwhere(pooled > 0).tolist()}')
+print('  Shifts of 1 within a pooling window leave the output identical. Shifts across a')
+print('  window boundary do not - pooling buys tolerance, not true invariance.')
+
+#%% md
+## 8. Receptive field, measured rather than argued
+
+The receptive field is the input region that can influence one output value. Rather than
+trusting the formula, **measure it with autograd**: put a gradient on one output pixel, then
+look at which input pixels received a nonzero gradient.
+
+#%% code
+def measure_receptive_field(layers, size=65):
+    """Backprop from the centre output pixel and measure the input footprint."""
+    net = nn.Sequential(*layers)
+    for p in net.parameters():
+        nn.init.constant_(p, 0.1)                     # any nonzero constant works
+    x = torch.zeros(1, 1, size, size, requires_grad=True)
+    y = net(x)
+    cy, cx = y.shape[-2] // 2, y.shape[-1] // 2
+    y[0, 0, cy, cx].backward()
+    g = x.grad[0, 0].abs().numpy()
+    ys, xs = np.nonzero(g > 0)
+    return (ys.max() - ys.min() + 1, xs.max() - xs.min() + 1), g
+
+def conv3(n):
+    return [nn.Conv2d(1, 1, 3, padding=1, bias=False) for _ in range(n)]
+
+print(f'{"stack":34} {"measured RF":>12} {"formula 1+2n":>13}')
+for n in [1, 2, 3, 5, 8]:
+    (rh, rw), _ = measure_receptive_field(conv3(n))
+    print(f'{n} x Conv2d(3x3, stride 1){"":9} {f"{rh}x{rw}":>12} {1 + 2 * n:>13}')
+    assert rh == 1 + 2 * n
+
+print('\nlinear growth with depth. Now add stride, and it compounds:')
+stacks = {
+    '3x3 s1, 3x3 s1':               [nn.Conv2d(1, 1, 3, padding=1, bias=False), nn.Conv2d(1, 1, 3, padding=1, bias=False)],
+    '3x3 s2, 3x3 s1':               [nn.Conv2d(1, 1, 3, stride=2, padding=1, bias=False), nn.Conv2d(1, 1, 3, padding=1, bias=False)],
+    '3x3 s1, avgpool2, 3x3 s1':     [nn.Conv2d(1, 1, 3, padding=1, bias=False), nn.AvgPool2d(2), nn.Conv2d(1, 1, 3, padding=1, bias=False)],
+    '3x3 dilation=2':               [nn.Conv2d(1, 1, 3, padding=2, dilation=2, bias=False)],
+    '3x3 d1, 3x3 d2, 3x3 d4':       [nn.Conv2d(1, 1, 3, padding=1, bias=False),
+                                     nn.Conv2d(1, 1, 3, padding=2, dilation=2, bias=False),
+                                     nn.Conv2d(1, 1, 3, padding=4, dilation=4, bias=False)],
+}
+for name, layers in stacks.items():
+    (rh, rw), _ = measure_receptive_field(layers)
+    print(f'  {name:28} -> {rh}x{rw}')
+print('\nStride and pooling multiply the growth; dilation grows it without losing resolution.')
+print('That last stack is the trick DeepLab uses for segmentation (chapter 6).')
+print()
+print('Why AvgPool2d and not MaxPool2d in that third stack? Max pooling routes the gradient')
+print('only to the argmax of each window, so on a constant input it reaches one pixel per')
+print('window and this measurement would UNDERSTATE the true footprint. The geometry of')
+print('MaxPool2d(2) is identical to AvgPool2d(2) - only the gradient routing differs.')
+print('Worth knowing: "measure it with autograd" is a great technique, and this is exactly')
+print('the kind of detail that makes a measurement lie to you.')
+
+#%% code
+fig, axes = plt.subplots(1, 4, figsize=(12, 3))
+for ax, n in zip(axes, [1, 2, 4, 8]):
+    (rh, rw), g = measure_receptive_field(conv3(n))
+    ax.imshow(g[20:45, 20:45] > 0, cmap='viridis')
+    ax.set_title(f'{n} conv layers\nRF = {rh}x{rw}', fontsize=9); ax.axis('off')
+plt.suptitle('which input pixels can influence one output pixel')
+plt.tight_layout()
+
+print('two 3x3 vs one 5x5 - same receptive field, cheaper and more expressive:')
+print(f'  one Conv2d(64, 64, 5): {conv_params(64, 64, 5):,} params, RF 5x5, 1 nonlinearity')
+print(f'  two Conv2d(64, 64, 3): {2 * conv_params(64, 64, 3):,} params, RF 5x5, 2 nonlinearities')
+print('  This single observation is the entire design of VGG.')
+
+#%% md
+## 9. The Conv-BN-ReLU block
+
+The unit that every modern CNN is built from. Note `bias=False`: BatchNorm has its own learned
+shift, so the conv's bias would be cancelled out.
+
+#%% code
+def conv_block(c_in, c_out, k=3, stride=1):
+    return nn.Sequential(
+        nn.Conv2d(c_in, c_out, k, stride=stride, padding=k // 2, bias=False),
+        nn.BatchNorm2d(c_out),
+        nn.ReLU(inplace=True),
+    )
+
+block = conv_block(3, 32)
+x = torch.randn(8, 3, 32, 32)
+print('block:', block)
+print('\ninput ', tuple(x.shape), '-> output', tuple(block(x).shape))
+print('params:', {n: tuple(p.shape) for n, p in block.named_parameters()})
+print('total :', sum(p.numel() for p in block.parameters()),
+      f'= conv {conv_params(3, 32, 3, bias=False)} + BN 2x32')
+
+print('\nwhy bias=False before BN:')
+with_bias = nn.Sequential(nn.Conv2d(3, 8, 3, padding=1, bias=True), nn.BatchNorm2d(8))
+no_bias = nn.Sequential(nn.Conv2d(3, 8, 3, padding=1, bias=False), nn.BatchNorm2d(8))
+no_bias[0].weight.data = with_bias[0].weight.data.clone()
+with torch.no_grad():
+    a, b = with_bias(x), no_bias(x)
+print('  outputs identical:', torch.allclose(a, b, atol=1e-5), '- BN subtracts the mean, so the bias vanishes')
+print('  so the bias is dead weight: C_out wasted parameters in every conv layer of the network')
+
+#%% code
+print('BatchNorm behaves DIFFERENTLY in train and eval mode - this is why model.eval() matters:')
+bn = nn.BatchNorm2d(3)
+xa = torch.randn(16, 3, 8, 8) * 5 + 10        # deliberately off-centre
+
+bn.train()
+out_train = bn(xa)
+print(f'  train(): uses THIS BATCH stats  -> out mean {out_train.mean():+.4f} std {out_train.std():.4f}')
+print(f'           and updates running stats: running_mean now {bn.running_mean.detach().numpy().round(3)}')
+
+bn.eval()
+with torch.no_grad():
+    out_eval = bn(xa)
+print(f'  eval() : uses RUNNING stats     -> out mean {out_eval.mean():+.4f} std {out_eval.std():.4f}')
+print('\nAfter one batch the running estimates are still poor, hence the gap. After a few hundred')
+print('they converge. Forgetting .eval() at validation time makes your metrics depend on batch')
+print('composition - a classic "why is validation noisy" bug.')
+
+print('\nand without a nonlinearity, depth buys nothing:')
+two_linear = nn.Sequential(nn.Conv2d(1, 1, 3, padding=1, bias=False), nn.Conv2d(1, 1, 3, padding=1, bias=False))
+print('  conv(conv(x)) with no activation is itself a single 5x5 convolution.')
+print('  ReLU between them is what makes the second layer able to express something new.')
+
+#%% md
+## 10. Why convolution, and not the linear layer from chapter 2
+
+Chapter 2 ended by showing that a linear model on flattened pixels collapses when the image
+shifts. Here is the same test on a convolution.
+
+#%% code
+test = np.zeros((32, 32), dtype=np.float32)
+test[8:16, 8:12] = 1.0                     # a small bright bar
+kernel = KERNELS['sobel x']
+
+conv_orig = conv2d_im2col(test, kernel, padding=1)
+shifted = np.roll(test, 5, axis=1)
+conv_shifted = conv2d_im2col(shifted, kernel, padding=1)
+conv_then_shift = np.roll(conv_orig, 5, axis=1)
+
+print('EQUIVARIANCE: conv(shift(x)) == shift(conv(x))?')
+print('  max difference:', np.abs(conv_shifted - conv_then_shift).max(), '-> exactly equal')
+print('\nThe feature map moves with the object, and the SAME 9 weights detect it at both')
+print('positions. A linear layer would need to relearn the feature at every location.')
+
+lin = nn.Linear(32 * 32, 1, bias=False)
+with torch.no_grad():
+    a = lin(to_torch(test).reshape(1, -1)).item()
+    b = lin(to_torch(shifted).reshape(1, -1)).item()
+print(f'\nfor comparison, a linear layer on the same two inputs: {a:.4f} vs {b:.4f}')
+print('  -> unrelated outputs. No shared structure at all.')
+
+fig, axes = plt.subplots(1, 4, figsize=(12, 3))
+for ax, (im, t) in zip(axes, [(test, 'input'), (np.abs(conv_orig), 'conv(input)'),
+                              (shifted, 'shifted input'), (np.abs(conv_shifted), 'conv(shifted)')]):
+    ax.imshow(im); ax.set_title(t, fontsize=9); ax.axis('off')
+plt.tight_layout()
+
+#%% md
+## 11. A first CNN, on paper then in code
+
+Design rule: when spatial size halves, channel count doubles. That keeps the compute per
+stage roughly constant while features get more abstract.
+
+Predict every shape before you run this cell.
+
+#%% code
+class TinyCNN(nn.Module):
+    def __init__(self, n_classes=10, c_in=3):
+        super().__init__()
+        self.stage1 = nn.Sequential(conv_block(c_in, 16), conv_block(16, 16), nn.MaxPool2d(2))
+        self.stage2 = nn.Sequential(conv_block(16, 32), conv_block(32, 32), nn.MaxPool2d(2))
+        self.stage3 = nn.Sequential(conv_block(32, 64), conv_block(64, 64), nn.MaxPool2d(2))
+        self.head = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(64, n_classes))
+
+    def forward(self, x):
+        x = self.stage1(x); x = self.stage2(x); x = self.stage3(x)
+        return self.head(x)
+
+
+model = TinyCNN()
+x = torch.randn(4, 3, 32, 32)
+
+print('shape trace:')
+h = x
+print(f'  input   {tuple(h.shape)}')
+for name in ['stage1', 'stage2', 'stage3']:
+    h = getattr(model, name)(h)
+    print(f'  {name}  {tuple(h.shape)}   <- spatial /2, channels x2')
+print(f'  head    {tuple(model.head(h).shape)}   <- GAP kills H,W; Linear gives logits')
+
+print(f'\ntotal parameters: {sum(p.numel() for p in model.parameters()):,}')
+print('per module:')
+for name, mod in model.named_children():
+    print(f'  {name:8} {sum(p.numel() for p in mod.parameters()):8,d}')
+
+print('\nglobal average pooling makes the head input-size agnostic:')
+for s in [32, 64, 96]:
+    with torch.no_grad():
+        print(f'  input {s}x{s} -> logits {tuple(model(torch.randn(1, 3, s, s)).shape)}')
+print('A Flatten+Linear head instead would hard-code one input size. This is why GAP won.')
+
+#%% md
+## 12. Augmentation preview
+
+Convolution gives you translation equivariance for free. Everything *else* - rotation, scale,
+colour, flips - you get by showing the network transformed copies during training. That's
+chapter 4, but here's what it looks like.
+
+#%% code
+from PIL import Image
+pil = Image.fromarray((img * 255).astype(np.uint8))
+
+try:
+    from torchvision.transforms import v2 as T
+    aug = T.Compose([T.RandomResizedCrop(160, scale=(0.6, 1.0), antialias=True),
+                     T.RandomHorizontalFlip(p=0.5),
+                     T.RandomRotation(15),
+                     T.ColorJitter(brightness=0.3, contrast=0.3)])
+    api = 'transforms.v2'
+except ImportError:
+    from torchvision import transforms as T
+    aug = T.Compose([T.RandomResizedCrop(160, scale=(0.6, 1.0)),
+                     T.RandomHorizontalFlip(p=0.5),
+                     T.RandomRotation(15),
+                     T.ColorJitter(brightness=0.3, contrast=0.3)])
+    api = 'transforms (v1)'
+
+torch.manual_seed(3)
+fig, axes = plt.subplots(1, 6, figsize=(14, 2.6))
+axes[0].imshow(img); axes[0].set_title('original', fontsize=9)
+for ax in axes[1:]:
+    ax.imshow(np.asarray(aug(pil)), cmap='gray'); ax.set_title('augmented', fontsize=9)
+for ax in axes: ax.axis('off')
+plt.suptitle(f'random augmentations ({api}) - the same label, five different tensors')
+plt.tight_layout()
+print('Augmentation is applied on the fly, per epoch, so the model rarely sees the same')
+print('exact tensor twice. Only on the TRAINING set - never on validation.')
+
+#%% md
+## What to remember
+
+| Idea | The one-liner |
+|---|---|
+| Convolution | slide, multiply, sum. Local + weight-shared + translation-equivariant |
+| Output size | $\lfloor (H + 2p - d(k-1) - 1)/s \rfloor + 1$ |
+| Size preserved | odd $k$, $p = (k-1)//2$, $s=1$ |
+| Size halved | $k=3, s=2, p=1$ (or max-pool 2) |
+| Weight shape | `(C_out, C_in, k, k)` - every filter spans all input channels |
+| Params | $C_{out} C_{in} k^2 + C_{out}$ |
+| 1x1 conv | per-pixel linear layer across channels |
+| Depthwise + 1x1 | ~8x cheaper than a full conv (MobileNet) |
+| Edge kernels | sum to 0; blur kernels sum to 1 |
+| Framework "conv" | really cross-correlation; scipy's `correlate2d` matches, `convolve2d` doesn't |
+| Pooling | no parameters; max for classifiers, GAP before the head |
+| Receptive field | $1 + 2n$ for $n$ stacked 3x3 stride-1; stride multiplies, dilation extends |
+| Two 3x3 > one 5x5 | fewer params, extra nonlinearity |
+| The block | `Conv2d(bias=False) -> BatchNorm2d -> ReLU` |
+| Implementation | im2col turns convolution into one GEMM - why GPUs love CNNs |
+
+Now do [`exercises/ex03_convolution.ipynb`](../exercises/ex03_convolution.ipynb).
+Chapter 4 trains the `TinyCNN` above on real images - **switch Colab to a GPU runtime first.**

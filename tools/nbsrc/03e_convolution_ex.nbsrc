@@ -1,0 +1,357 @@
+#out exercises/ex03_convolution.ipynb
+#gpu off
+
+#%% md
+# Exercise 3 - Convolution
+
+Eight tasks, CPU only. The theme: **predict before you run.** Several tasks ask you to write
+down an answer in a markdown cell first - do that honestly, it's where the learning is.
+
+#%% code
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from numpy.lib.stride_tricks import sliding_window_view
+
+plt.rcParams['figure.dpi'] = 110
+plt.rcParams['image.cmap'] = 'gray'
+rng = np.random.default_rng(0)
+torch.manual_seed(0)
+
+def load_test_image(size=160):
+    try:
+        import matplotlib.cbook as cbook
+        from PIL import Image
+        with cbook.get_sample_data('grace_hopper.jpg') as f:
+            im = Image.open(f).convert('L').resize((size, size), Image.BILINEAR)
+        return np.asarray(im, dtype=np.float32) / 255.0
+    except Exception:
+        from PIL import Image, ImageDraw
+        im = Image.new('L', (size, size), 30)
+        d = ImageDraw.Draw(im)
+        d.ellipse([20, 20, 80, 80], fill=220)
+        d.rectangle([95, 25, 145, 85], fill=140)
+        for x in range(95, 150, 8):
+            d.line([(x, 100), (x, 145)], fill=240, width=3)
+        return np.asarray(im, dtype=np.float32) / 255.0
+
+img = load_test_image()
+SOBEL_X = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
+GAUSS = np.array([[1, 2, 1], [2, 4, 2], [1, 2, 1]], dtype=np.float32) / 16
+print('image', img.shape, '| setup ok')
+
+#%% md
+---
+## Task 1 - The output size formula
+
+Implement it, no `if` statements, no calling PyTorch. Then the cell checks you against
+`F.conv2d` on nine cases, including a couple where the floor division bites.
+
+$$H_{out} = \left\lfloor \frac{H_{in} + 2p - d(k-1) - 1}{s} \right\rfloor + 1$$
+
+#%% code
+def conv_out_size(in_size, k, stride=1, padding=0, dilation=1):
+    """Spatial output size of a convolution. One expression."""
+    # TODO
+    raise NotImplementedError
+
+
+cases = [(32, 3, 1, 1, 1), (32, 3, 1, 0, 1), (32, 5, 1, 2, 1), (32, 3, 2, 1, 1),
+         (32, 7, 2, 3, 1), (32, 3, 1, 2, 2), (31, 3, 2, 0, 1), (28, 5, 3, 0, 1), (64, 1, 1, 0, 1)]
+for in_size, k, s, p, d in cases:
+    mine = conv_out_size(in_size, k, s, p, d)
+    real = F.conv2d(torch.zeros(1, 1, in_size, in_size), torch.zeros(1, 1, k, k),
+                    stride=s, padding=p, dilation=d).shape[-1]
+    assert mine == real, f'in={in_size} k={k} s={s} p={p} d={d}: you said {mine}, torch says {real}'
+print('PASS  all 9 cases match F.conv2d')
+
+print('\nnow answer without running anything, then check:')
+q = [('preserve size with k=7, stride 1: padding = ?', 3),
+     ('input 64, k=3, s=2, p=1 -> output?', 32),
+     ('input 64, k=3, s=1, p=0, applied 3 times -> output?', 58)]
+for text, ans in q:
+    print(f'  {text:52} {ans}')
+assert conv_out_size(64, 7, 1, 3) == 64
+assert conv_out_size(64, 3, 2, 1) == 32
+assert conv_out_size(conv_out_size(conv_out_size(64, 3), 3), 3) == 58
+print('  ...all consistent with your formula')
+
+#%% md
+---
+## Task 2 - Convolution from scratch
+
+Implement single-channel cross-correlation with loops. Support `stride` and `padding`
+(zero padding). Match `F.conv2d` to within `1e-4`.
+
+Remember: cross-correlation, **not** flipped convolution.
+
+#%% code
+def conv2d_naive(x, kernel, stride=1, padding=0):
+    """(H, W) float32 in, (H_out, W_out) float32 out. Loops are fine here."""
+    # TODO
+    raise NotImplementedError
+
+
+for k, s, p in [(SOBEL_X, 1, 0), (SOBEL_X, 1, 1), (GAUSS, 2, 1), (GAUSS, 3, 2)]:
+    mine = conv2d_naive(img, k, stride=s, padding=p)
+    ref = F.conv2d(torch.from_numpy(img)[None, None],
+                   torch.from_numpy(k)[None, None], stride=s, padding=p)[0, 0].numpy()
+    assert mine.shape == ref.shape, f'stride={s} padding={p}: shape {mine.shape} != torch {ref.shape}'
+    assert np.allclose(mine, ref, atol=1e-4), f'stride={s} padding={p}: values differ by {np.abs(mine - ref).max():.2e}'
+    print(f'PASS  stride={s} padding={p} -> {mine.shape}')
+
+flipped = F.conv2d(torch.from_numpy(img)[None, None],
+                   torch.from_numpy(np.ascontiguousarray(np.flip(SOBEL_X)))[None, None], padding=1)[0, 0].numpy()
+mine = conv2d_naive(img, SOBEL_X, padding=1)
+print('\nsanity: your output should NOT match the flipped-kernel result:', not np.allclose(mine, flipped, atol=1e-4))
+
+#%% md
+---
+## Task 3 - Vectorize it
+
+Same function, no Python loops over pixels. Use `sliding_window_view` and `np.einsum`.
+Must be at least 20x faster than your loop version on a 384x384 image.
+
+#%% code
+def conv2d_fast(x, kernel, stride=1, padding=0):
+    """Vectorized single-channel cross-correlation."""
+    # TODO
+    raise NotImplementedError
+
+
+big = rng.random((384, 384)).astype(np.float32)
+for s, p in [(1, 1), (2, 1), (1, 0)]:
+    a = conv2d_naive(big, GAUSS, stride=s, padding=p)
+    b = conv2d_fast(big, GAUSS, stride=s, padding=p)
+    assert a.shape == b.shape and np.allclose(a, b, atol=1e-4), f'mismatch at stride={s} padding={p}'
+
+t0 = time.perf_counter(); conv2d_naive(big, GAUSS, padding=1); t_slow = time.perf_counter() - t0
+t0 = time.perf_counter(); conv2d_fast(big, GAUSS, padding=1); t_fast = time.perf_counter() - t0
+assert t_slow / t_fast > 20, f'only {t_slow / t_fast:.1f}x faster - are you still looping?'
+print(f'PASS  naive {t_slow * 1000:8.1f} ms | vectorized {t_fast * 1000:6.2f} ms | {t_slow / t_fast:.0f}x')
+
+#%% md
+---
+## Task 4 - Design a kernel
+
+Build three 3x3 kernels from scratch:
+
+1. `sharpen` - increases local contrast, **sums to 1** so overall brightness is unchanged.
+2. `sobel_y` - responds to **horizontal** edges, positive when brightness increases downward.
+3. `blur5` - a 5x5 normalized box blur.
+
+Then apply all three and check the assertions about their sums and effects.
+
+#%% code
+# TODO: define sharpen (3x3), sobel_y (3x3), blur5 (5x5), all float32
+
+assert sharpen.shape == (3, 3) and abs(sharpen.sum() - 1.0) < 1e-6, 'sharpen must sum to 1'
+assert sobel_y.shape == (3, 3) and abs(sobel_y.sum()) < 1e-6, 'edge kernels must sum to 0'
+assert blur5.shape == (5, 5) and abs(blur5.sum() - 1.0) < 1e-6, 'blur must sum to 1'
+
+flat = np.full((16, 16), 0.5, dtype=np.float32)
+assert abs(conv2d_fast(flat, sobel_y, padding=1)[8, 8]) < 1e-6, 'sobel_y must give 0 on a flat region'
+assert abs(conv2d_fast(flat, sharpen, padding=1)[8, 8] - 0.5) < 1e-6, 'sharpen must leave a flat region unchanged'
+
+ramp_down = np.tile(np.linspace(0, 1, 16, dtype=np.float32)[:, None], (1, 16))   # brightens downward
+assert conv2d_fast(ramp_down, sobel_y, padding=1)[8, 8] > 0, 'sobel_y should be positive when brightness increases downward'
+
+sharpened = conv2d_fast(img, sharpen, padding=1)
+blurred = conv2d_fast(img, blur5, padding=2)
+assert sharpened.std() > img.std() > blurred.std(), 'sharpen should raise contrast, blur should lower it'
+print(f'PASS  std: blurred {blurred.std():.4f} < original {img.std():.4f} < sharpened {sharpened.std():.4f}')
+
+fig, axes = plt.subplots(1, 4, figsize=(12, 3))
+for ax, (im, t) in zip(axes, [(img, 'original'), (np.clip(sharpened, 0, 1), 'sharpen'),
+                              (np.clip(blurred, 0, 1), 'blur 5x5'),
+                              (np.abs(conv2d_fast(img, sobel_y, padding=1)), '|sobel y|')]):
+    ax.imshow(im); ax.set_title(t, fontsize=9); ax.axis('off')
+plt.tight_layout()
+
+#%% md
+---
+## Task 5 - Parameter counting
+
+Implement `conv_params(c_in, c_out, k, bias=True, groups=1)` and match `nn.Conv2d` exactly
+for every case below, including grouped and depthwise convolutions.
+
+Then fill in the answers in the markdown cell **before** running the last block.
+
+#%% code
+def conv_params(c_in, c_out, k, bias=True, groups=1):
+    """Number of learnable parameters in a Conv2d layer."""
+    # TODO
+    raise NotImplementedError
+
+
+for c_in, c_out, k, bias, groups in [(3, 16, 3, True, 1), (3, 64, 7, True, 1), (64, 64, 3, False, 1),
+                                     (512, 512, 3, True, 1), (512, 128, 1, True, 1),
+                                     (64, 64, 3, False, 64), (64, 128, 3, True, 4)]:
+    real = sum(p.numel() for p in nn.Conv2d(c_in, c_out, k, bias=bias, groups=groups).parameters())
+    mine = conv_params(c_in, c_out, k, bias=bias, groups=groups)
+    assert mine == real, f'Conv2d({c_in},{c_out},{k},bias={bias},groups={groups}): you {mine}, torch {real}'
+print('PASS  all cases match nn.Conv2d')
+
+#%% md
+**Predict these before running the next cell:**
+
+| Layer | Your answer |
+|---|---|
+| `Conv2d(3, 32, 3)` params | ... |
+| `Conv2d(32, 64, 3)` on a `(8, 32, 16, 16)` input, output shape | ... |
+| depthwise `Conv2d(128, 128, 3, groups=128)` + `Conv2d(128, 128, 1)` vs full `Conv2d(128, 128, 3)` - ratio | ... |
+
+#%% code
+print('Conv2d(3, 32, 3) params           :', conv_params(3, 32, 3))
+print('Conv2d(32,64,3,padding=1) on (8,32,16,16):',
+      tuple(nn.Conv2d(32, 64, 3, padding=1)(torch.zeros(8, 32, 16, 16)).shape))
+full = conv_params(128, 128, 3)
+sep = conv_params(128, 128, 3, groups=128) + conv_params(128, 128, 1)
+print(f'full conv {full:,} vs depthwise separable {sep:,} -> {full / sep:.1f}x cheaper')
+
+#%% md
+---
+## Task 6 - Receptive field
+
+Two parts.
+
+1. `receptive_field(kernels, strides)` - compute it from the formula
+   $\text{RF} = 1 + \sum_l (k_l - 1)\prod_{i<l} s_i$.
+2. `measure_receptive_field(layers)` - measure it empirically with autograd: put all-constant
+   weights on a conv stack, backprop from the centre output pixel, and return the bounding-box
+   height of the nonzero input gradient.
+
+They must agree.
+
+#%% code
+def receptive_field(kernels, strides):
+    """From the formula. kernels/strides are equal-length lists, input to output order."""
+    # TODO
+    raise NotImplementedError
+
+
+def measure_receptive_field(layers, size=81):
+    """Empirical: backprop from the centre output pixel, return the input footprint height."""
+    # TODO: build nn.Sequential, set all weights to a nonzero constant,
+    #       make a zero input with requires_grad=True, backward from the centre, measure
+    raise NotImplementedError
+
+
+assert receptive_field([3], [1]) == 3
+assert receptive_field([3, 3], [1, 1]) == 5
+assert receptive_field([3, 3, 3], [1, 1, 1]) == 7
+assert receptive_field([3, 3], [2, 1]) == 5
+assert receptive_field([7, 3, 3], [2, 1, 1]) == 15
+print('PASS  formula cases')
+
+def conv3(n, stride=1):
+    return [nn.Conv2d(1, 1, 3, stride=stride, padding=1, bias=False) for _ in range(n)]
+
+for n in [1, 2, 3, 5]:
+    measured = measure_receptive_field(conv3(n))
+    formula = receptive_field([3] * n, [1] * n)
+    assert measured == formula, f'{n} layers: measured {measured}, formula {formula}'
+    print(f'PASS  {n} x 3x3 stride 1 -> RF {measured} (formula {formula})')
+
+#%% md
+**Question:** your object of interest is 40 pixels across, and your network is 4 stacked 3x3
+stride-1 convolutions. Can it ever see the whole object at once? What are your three options?
+
+*Your answer:* ...
+
+---
+## Task 7 - Build a CNN to a spec
+
+Build `SpecCNN` satisfying **all** of these:
+
+- input `(N, 3, 64, 64)`, output `(N, 10)` logits
+- exactly **three** downsampling steps, so the spatial size goes 64 -> 32 -> 16 -> 8
+- channels progress 3 -> 16 -> 32 -> 64
+- every conv is `Conv2d(..., 3, padding=1, bias=False)` followed by `BatchNorm2d` then `ReLU`
+- the head is global average pooling -> `Flatten` -> `Linear`
+- fewer than 40,000 parameters
+- works for **any** input size >= 32 without changing the code
+
+#%% code
+class SpecCNN(nn.Module):
+    def __init__(self, n_classes=10, c_in=3):
+        super().__init__()
+        # TODO
+        raise NotImplementedError
+
+    def forward(self, x):
+        # TODO
+        raise NotImplementedError
+
+
+model = SpecCNN()
+out = model(torch.randn(4, 3, 64, 64))
+n_params = sum(p.numel() for p in model.parameters())
+
+assert out.shape == (4, 10), f'output {tuple(out.shape)} should be (4, 10)'
+assert n_params < 40_000, f'{n_params:,} parameters - too many'
+assert sum(1 for m in model.modules() if isinstance(m, nn.BatchNorm2d)) >= 3, 'use BatchNorm'
+assert all(m.bias is None for m in model.modules() if isinstance(m, nn.Conv2d)), 'convs before BN should have bias=False'
+for s in [32, 96, 128]:
+    assert model(torch.randn(1, 3, s, s)).shape == (1, 10), f'failed at input size {s}'
+print(f'PASS  {n_params:,} parameters, size-agnostic')
+
+h = torch.randn(1, 3, 64, 64)
+print('\nshape trace:')
+for name, mod in model.named_children():
+    h = mod(h)
+    print(f'  after {name:10} {tuple(h.shape)}')
+
+#%% md
+---
+## Task 8 - Equivariance, demonstrated
+
+Show numerically that convolution commutes with translation and a linear layer does not.
+
+Write `equivariance_error(op, x, shift)` returning
+`max |op(shift(x)) - shift(op(x))|`, where `shift` rolls along the width axis.
+
+Use `np.roll` for the shift, and check it for a convolution and for a random linear map on
+the flattened image.
+
+#%% code
+def equivariance_error(op, x, shift):
+    """op: (H, W) -> (H, W). Returns max |op(roll(x)) - roll(op(x))| along axis=1."""
+    # TODO
+    raise NotImplementedError
+
+
+test = np.zeros((32, 32), dtype=np.float32)
+test[8:16, 8:12] = 1.0
+
+conv_op = lambda a: conv2d_fast(a, SOBEL_X, padding=1)
+lin_W = rng.normal(size=(32 * 32, 32 * 32)).astype(np.float32) * 0.01
+lin_op = lambda a: (a.reshape(1, -1) @ lin_W).reshape(32, 32)
+
+err_conv = equivariance_error(conv_op, test, 5)
+err_lin = equivariance_error(lin_op, test, 5)
+
+print(f'convolution      max error {err_conv:.2e}')
+print(f'random linear map max error {err_lin:.2e}')
+assert err_conv < 1e-5, f'convolution should be equivariant, got {err_conv:.2e}'
+assert err_lin > 1e-2, 'a random linear map should NOT be equivariant'
+print('PASS')
+
+#%% md
+**Question:** convolution is equivariant to *translation*. Name two transformations it is
+**not** equivariant to, and say how a CNN copes with them anyway.
+
+*Your answer:* ...
+
+---
+## Done
+
+- [ ] I can compute output shapes and parameter counts without running code.
+- [ ] I know why the weight tensor is `(C_out, C_in, k, k)`.
+- [ ] I can explain why two 3x3 convs beat one 5x5.
+- [ ] I know what `bias=False` before BatchNorm is for.
+
+Solutions: [`solutions/sol03_convolution.ipynb`](solutions/sol03_convolution.ipynb)

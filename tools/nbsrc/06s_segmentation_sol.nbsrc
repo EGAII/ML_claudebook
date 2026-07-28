@@ -1,0 +1,711 @@
+#out exercises/solutions/sol06_segmentation.ipynb
+#gpu on
+
+#%% md
+# Solutions 6 - Semantic segmentation
+
+Answers to [`ex06_segmentation.ipynb`](../ex06_segmentation.ipynb), with reasoning.
+
+> **GPU: Runtime -> Change runtime type -> T4 GPU.**
+
+#%% code
+import time, math
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image, ImageDraw
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print('torch', torch.__version__, '| device', device)
+
+try:
+    import google.colab  # noqa: F401
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+NUM_WORKERS = 2 if IN_COLAB else 0
+
+def set_seed(seed=0):
+    import random
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+set_seed(0)
+torch.backends.cudnn.benchmark = True
+plt.rcParams['figure.dpi'] = 110
+
+IMG_SIZE = 96
+N_CLASSES = 2
+CLASS_NAMES = ['background', 'blob']
+
+def make_sample(rng, size=IMG_SIZE):
+    img = Image.new('L', (size, size), int(rng.integers(25, 60)))
+    mask = Image.new('L', (size, size), 0)
+    d, dm = ImageDraw.Draw(img), ImageDraw.Draw(mask)
+    for _ in range(int(rng.integers(4, 10))):
+        x, y = int(rng.integers(0, size)), int(rng.integers(0, size))
+        r = int(rng.integers(3, 9))
+        d.ellipse([x - r, y - r, x + r, y + r], fill=int(rng.integers(60, 95)))
+    for _ in range(int(rng.integers(1, 4))):
+        w, h = int(rng.integers(10, 26)), int(rng.integers(10, 26))
+        x0, y0 = int(rng.integers(0, size - w)), int(rng.integers(0, size - h))
+        box = [x0, y0, x0 + w, y0 + h]
+        d.ellipse(box, fill=int(rng.integers(190, 255)))
+        dm.ellipse(box, fill=1)
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    arr = np.clip(arr + rng.normal(0, 0.05, arr.shape).astype(np.float32), 0, 1)
+    return np.stack([arr] * 3, axis=-1), np.asarray(mask, dtype=np.int64)
+
+class BlobDataset(Dataset):
+    def __init__(self, n, seed=0, augment=False):
+        rng = np.random.default_rng(seed)
+        self.items = [make_sample(rng) for _ in range(n)]
+        self.augment = augment
+        self.rng = np.random.default_rng(seed + 555)
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, i):
+        img, mask = self.items[i]
+        if self.augment:
+            img, mask = paired_augment(img, mask, self.rng)
+        return (torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1))),
+                torch.from_numpy(np.ascontiguousarray(mask)))
+
+train_ds_raw = BlobDataset(500, seed=0)
+val_ds = BlobDataset(120, seed=777)
+all_val_masks = np.stack([m for _, m in val_ds.items])
+fg = float((all_val_masks > 0).mean())
+print(f'train {len(train_ds_raw)} | val {len(val_ds)} | foreground {100 * fg:.1f}% of pixels')
+
+#%% md
+---
+## Task 1 - Paired augmentation
+
+#%% code
+def paired_augment(img, mask, rng):
+    if rng.random() < 0.5:
+        img, mask = img[:, ::-1], mask[:, ::-1]
+    if rng.random() < 0.5:
+        img, mask = img[::-1], mask[::-1]
+    k = int(rng.integers(0, 4))
+    if k:
+        img = np.rot90(img, k, axes=(0, 1))
+        mask = np.rot90(mask, k, axes=(0, 1))
+    return np.ascontiguousarray(img), np.ascontiguousarray(mask)
+
+
+img0, mask0 = val_ds.items[0]
+def alignment(img, mask):
+    return float(((img.mean(-1) > 0.6) & (mask > 0)).sum() / max((mask > 0).sum(), 1))
+
+base = alignment(img0, mask0)
+for trial in range(6):
+    a, b = paired_augment(img0, mask0, np.random.default_rng(trial))
+    assert b.dtype == np.int64 and a.flags['C_CONTIGUOUS'] and b.flags['C_CONTIGUOUS']
+    assert abs(alignment(a, b) - base) < 0.05
+print(f'PASS  alignment preserved (baseline {base:.3f})')
+
+train_ds = BlobDataset(500, seed=0, augment=True)
+train_loader = DataLoader(train_ds, batch_size=16, shuffle=True, num_workers=NUM_WORKERS,
+                          pin_memory=device.type == 'cuda', drop_last=True)
+val_loader = DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=NUM_WORKERS,
+                        pin_memory=device.type == 'cuda')
+
+#%% md
+### Why this way
+
+**One `rng`, consumed once, driving both.** The transform decisions are made in the function and
+applied to both arrays in the same breath. There is no way for the two to diverge - which is
+exactly the property you need, and exactly what two separate `transforms.Compose` pipelines with
+random parameters *cannot* give you.
+
+**Why `axes=(0, 1)` on `np.rot90`.** The image is `(H, W, 3)` and the mask is `(H, W)`. Naming the
+spatial axes explicitly makes the same call correct for both ranks. Default `axes=(0,1)` happens to
+be right here, but relying on the default breaks the day you switch to CHW.
+
+**Why `np.ascontiguousarray` at the end.** `[::-1]` and `rot90` return *views with negative or
+permuted strides*. `torch.from_numpy` rejects negative strides outright:
+`ValueError: At least one stride in the given numpy array is negative`. One memcpy per sample; not
+worth optimizing.
+
+**Why the mask must stay `int64`.** A stray `.astype(np.float32)` (or an arithmetic op that promotes)
+would break `CrossEntropyLoss` much later, with an error message about the target dtype that gives
+no hint about where it came from.
+
+**Geometric augmentations only.** Brightness/contrast/noise would be fine on the image *alone* -
+they don't move pixels, so the mask needn't change. Anything that moves pixels must be paired. That
+line is the one to remember: **geometry is paired, photometry is not.**
+
+**How the assertion catches the bug.** `alignment` measures the fraction of labelled pixels where
+the image is actually bright. Paired transforms keep that near its baseline; independent transforms
+send it toward the random-overlap level. This is the trick worth stealing: to test a pairing
+invariant, measure a quantity that *only* holds when the pairing is correct.
+
+#%% md
+---
+## Task 2 - Metrics from a confusion matrix
+
+#%% code
+def confusion_matrix(target, pred, k=N_CLASSES):
+    t = np.asarray(target).ravel().astype(np.int64)
+    p = np.asarray(pred).ravel().astype(np.int64)
+    return np.bincount(t * k + p, minlength=k * k).reshape(k, k)
+
+def iou_from_cm(cm):
+    tp = np.diag(cm).astype(np.float64)
+    fp = cm.sum(0) - tp
+    fn = cm.sum(1) - tp
+    denom = tp + fp + fn
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return np.where(denom > 0, tp / denom, np.nan)
+
+def dice_from_cm(cm):
+    tp = np.diag(cm).astype(np.float64)
+    fp = cm.sum(0) - tp
+    fn = cm.sum(1) - tp
+    denom = 2 * tp + fp + fn
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return np.where(denom > 0, 2 * tp / denom, np.nan)
+
+def pixel_accuracy(cm):
+    return float(np.diag(cm).sum() / cm.sum())
+
+
+perfect = confusion_matrix(all_val_masks, all_val_masks)
+lazy = confusion_matrix(all_val_masks, np.zeros_like(all_val_masks))
+absent = confusion_matrix(np.zeros((4, 4), dtype=np.int64), np.zeros((4, 4), dtype=np.int64))
+assert np.allclose(iou_from_cm(perfect), 1.0) and abs(iou_from_cm(lazy)[1]) < 1e-12
+assert np.isnan(iou_from_cm(absent)[1])
+print('PASS')
+print(f'  do-nothing model: pixel acc {pixel_accuracy(lazy):.4f} | fg IoU {iou_from_cm(lazy)[1]:.4f}')
+print(f'  perfect model   : pixel acc {pixel_accuracy(perfect):.4f} | fg IoU {iou_from_cm(perfect)[1]:.4f}')
+
+#%% md
+### Why this way
+
+**TP, FP, FN read straight off the matrix.** With rows = actual and columns = predicted:
+
+- `np.diag(cm)` - correct pixels per class (TP)
+- `cm.sum(axis=0) - tp` - predicted as class `c` but weren't (FP)
+- `cm.sum(axis=1) - tp` - were class `c` but predicted otherwise (FN)
+
+Every segmentation metric is some arrangement of those three. Learn to read them off the matrix and
+you never need to look up a formula again.
+
+**True negatives never appear.** That's the whole point of IoU and Dice, and the reason a
+predict-background model scores 0 on the foreground class while pixel accuracy - which *does* count
+TN - gives it 90%.
+
+**`np.nan` for absent classes, not 0.** A class with `TP+FP+FN == 0` was never present in the truth
+*and* never predicted. Scoring it 0 punishes a model for a class it was never shown, and makes your
+mIoU depend on which images happened to land in the batch. Report `NaN` and aggregate with
+`np.nanmean`. A class present in the truth but never predicted correctly genuinely scores 0 - the
+distinction matters.
+
+**Why `bincount` and not a loop.** `t * k + p` flattens each `(actual, predicted)` pair into one
+integer; `bincount` counts all of them in one pass. For a validation set of 120 images at 96x96
+that's a million pixels - a Python loop is unthinkable and even a per-class boolean-mask loop is `k^2`
+passes.
+
+**Accumulate across batches, never average per-batch IoU.** The average of ratios is not the ratio
+of sums. A batch with no foreground contributes `0/0`, and if you replaced that with 0 you'd drag
+the average down for no reason. Sum confusion matrices, compute the metric once at the end.
+
+#%% md
+---
+## Task 3 - Dice loss
+
+#%% code
+def dice_loss(logits, target, eps=1.0):
+    n_classes = logits.shape[1]
+    probs = torch.softmax(logits.float(), dim=1)                          # fp32: fp16 sums overflow
+    target_1h = F.one_hot(target, n_classes).permute(0, 3, 1, 2).float()
+    dims = (0, 2, 3)                                                      # keep the class axis
+    inter = (probs * target_1h).sum(dims)
+    denom = probs.sum(dims) + target_1h.sum(dims)
+    dice = (2 * inter + eps) / (denom + eps)                              # (C,)
+    return 1 - dice.mean()
+
+
+N, C, H, W = 4, 2, 16, 16
+tgt = torch.randint(0, C, (N, H, W))
+perfect_logits = (F.one_hot(tgt, C).permute(0, 3, 1, 2).float() - 0.5) * 60
+worst_logits = (F.one_hot(1 - tgt, C).permute(0, 3, 1, 2).float() - 0.5) * 60
+flat = torch.zeros(N, C, H, W)
+g = torch.zeros(N, C, H, W, requires_grad=True)
+dice_loss(g, tgt).backward()
+assert dice_loss(perfect_logits, tgt).item() < 0.02
+assert dice_loss(worst_logits, tgt).item() > 0.9
+assert 0.3 < dice_loss(flat, tgt).item() < 0.7
+assert g.grad.abs().sum() > 0
+print(f'PASS  perfect {dice_loss(perfect_logits, tgt).item():.4f} | uniform {dice_loss(flat, tgt).item():.4f} '
+      f'| inverted {dice_loss(worst_logits, tgt).item():.4f}')
+
+#%% md
+### Why this way
+
+**Softmax, not argmax.** `argmax` is piecewise constant, so its gradient is zero almost everywhere -
+the model would never learn. The "soft" in soft Dice means we substitute probabilities for the
+binary indicator, which makes the metric differentiable. This is a pattern worth internalising:
+*to optimize a discrete metric, find a differentiable relaxation of it.*
+
+**`dims = (0, 2, 3)` - keep the class axis.** Summing over classes too would give you one global
+Dice dominated by background. Per-class Dice, then mean, is what makes the loss immune to imbalance:
+the foreground term is a *ratio* within the foreground class, so a class covering 10% of pixels
+contributes as much as one covering 90%.
+
+**`eps` on both numerator and denominator.** If a class is absent from the batch *and* not predicted,
+both are 0 and you get `0/0 = nan`, which poisons the entire backward pass. With `eps` on both, the
+term becomes `eps/eps = 1` - correctly saying "nothing to find, nothing missed, no penalty". Putting
+`eps` only on the denominator would give 0, i.e. a full penalty for a class that isn't there.
+
+`eps=1.0` (rather than `1e-6`) also gently smooths tiny classes; both conventions exist, and the
+larger value is more numerically forgiving.
+
+**`.float()` under AMP is not cosmetic.** We sum over `N*H*W` elements - 1024 in this test, ~150k in
+training. float16 saturates at 65504, so an fp16 sum overflows to `inf`, the ratio becomes `nan`, and
+`GradScaler` then skips every step while your loss prints as `nan`. Debugging that from scratch takes
+an afternoon; the `.float()` costs nothing.
+
+**Why `1 - dice`.** Optimizers minimize. Dice is a similarity in [0,1], so `1 - dice` is the distance.
+
+**Why combine with CE.** Dice's gradient is small when overlap is already decent and it's noisy for
+small objects, whereas CE gives clean per-pixel gradients everywhere but is dominated by the majority
+class. `CE + Dice` is the standard, and it's the default in essentially every competitive
+segmentation solution.
+
+#%% md
+---
+## Task 4 - The U-Net
+
+#%% code
+class DoubleConv(nn.Module):
+    def __init__(self, c_in, c_out):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(c_in, c_out, 3, padding=1, bias=False),
+            nn.BatchNorm2d(c_out), nn.ReLU(inplace=True),
+            nn.Conv2d(c_out, c_out, 3, padding=1, bias=False),
+            nn.BatchNorm2d(c_out), nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class Up(nn.Module):
+    def __init__(self, c_in, c_skip, c_out):
+        super().__init__()
+        self.up = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(c_in, c_in // 2, 3, padding=1, bias=False))
+        self.conv = DoubleConv(c_in // 2 + c_skip, c_out)
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        if x.shape[-2:] != skip.shape[-2:]:
+            x = F.interpolate(x, size=skip.shape[-2:], mode='nearest')
+        return self.conv(torch.cat([x, skip], dim=1))
+
+
+class UNet(nn.Module):
+    def __init__(self, n_classes=N_CLASSES, c_in=3, base=16, use_skips=True):
+        super().__init__()
+        b = base
+        self.use_skips = use_skips
+        self.enc1 = DoubleConv(c_in, b)
+        self.enc2 = DoubleConv(b, 2 * b)
+        self.bottleneck = DoubleConv(2 * b, 4 * b)
+        self.pool = nn.MaxPool2d(2)
+        self.up2 = Up(4 * b, 2 * b, 2 * b)
+        self.up1 = Up(2 * b, b, b)
+        self.out = nn.Conv2d(b, n_classes, kernel_size=1)
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        bo = self.bottleneck(self.pool(e2))
+        if not self.use_skips:
+            e1, e2 = torch.zeros_like(e1), torch.zeros_like(e2)
+        d2 = self.up2(bo, e2)
+        d1 = self.up1(d2, e1)
+        return self.out(d1)
+
+
+model = UNet().to(device)
+n_params = sum(p.numel() for p in model.parameters())
+with torch.no_grad():
+    assert model(torch.randn(2, 3, 96, 96, device=device)).shape == (2, 2, 96, 96)
+    for s in [64, 100, 128]:
+        assert model(torch.randn(1, 3, s, s, device=device)).shape[-2:] == (s, s)
+print(f'PASS  {n_params:,} parameters, output size always matches input')
+
+h = torch.randn(1, 3, 96, 96, device=device)
+with torch.no_grad():
+    e1 = model.enc1(h); e2 = model.enc2(model.pool(e1)); bo = model.bottleneck(model.pool(e2))
+    d2 = model.up2(bo, e2); d1 = model.up1(d2, e1)
+    for nm, t in [('input', h), ('enc1', e1), ('enc2', e2), ('bottleneck', bo),
+                  ('up2', d2), ('up1', d1), ('out', model.out(d1))]:
+        print(f'  {nm:11} {tuple(t.shape)}')
+
+#%% md
+### Why this design
+
+**`torch.cat([x, skip], dim=1)` - concatenate, don't add.** Concatenation along channels lets the
+following `DoubleConv` *learn* how to weigh coarse semantic features against fine spatial ones.
+Addition (ResNet-style) would force them into the same representation and requires matching channel
+counts. Concatenation is U-Net's actual contribution, and it's why `Up`'s input channel count is
+`c_in // 2 + c_skip`.
+
+**`Upsample(bilinear) + Conv` rather than `ConvTranspose2d`.** Transposed convolution produces
+**checkerboard artifacts** whenever the kernel size isn't divisible by the stride, because output
+pixels receive different numbers of contributions. Upsample-then-convolve avoids it entirely for
+almost the same cost. (If you do use `ConvTranspose2d`, use `kernel_size=2, stride=2` - the one
+clean case.)
+
+**Note this is the one place bilinear interpolation is correct.** We're upsampling *feature maps*
+(continuous activations), not label masks. Bilinear on a mask invents classes; bilinear on features
+is exactly right. Same operation, opposite verdict, depending on what the tensor *means*.
+
+**The size guard in `forward` is the practical detail.** Two pooling levels means the input must be
+divisible by 4. At input 100: `100 -> 50 -> 25`, then upsampling gives `50` and `100` and it happens
+to work; at 98 you'd get `98 -> 49 -> 24 -> 48 != 49` and `torch.cat` would raise a shape error. The
+`F.interpolate(..., size=skip.shape[-2:])` line absorbs the off-by-one. The original U-Net paper
+*cropped* the skips instead (its convs were unpadded, so sizes never matched). On real data the
+cleanest approach is to pad the input up to a multiple of the total downsampling factor, predict, and
+crop back.
+
+**`nn.Conv2d(b, n_classes, 1)` as the output.** A 1x1 convolution is a per-pixel linear classifier
+across channels - literally chapter 2's softmax regression applied at every pixel. **No softmax
+here**: `CrossEntropyLoss` wants logits.
+
+**`use_skips=False` via `zeros_like`** keeps the parameter count and every tensor shape identical, so
+the ablation in task 7 isolates exactly one variable. Deleting the concatenation instead would also
+shrink the following conv, and you'd be measuring two changes at once.
+
+#%% md
+---
+## Task 5 - Train
+
+#%% code
+ce = nn.CrossEntropyLoss()
+
+def combined_loss(logits, target):
+    return ce(logits, target) + dice_loss(logits, target)
+
+
+def train_epoch(model, loader, optimizer, loss_fn, scheduler=None):
+    model.train()
+    tot, seen = 0.0, 0
+    for xb, yb in loader:
+        xb = xb.to(device, non_blocking=True)
+        yb = yb.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        loss = loss_fn(model(xb), yb)
+        loss.backward()
+        optimizer.step()
+        tot += loss.item() * xb.size(0)
+        seen += xb.size(0)
+    if scheduler is not None:
+        scheduler.step()
+    return tot / seen
+
+
+@torch.no_grad()
+def evaluate_seg(model, loader, loss_fn):
+    model.eval()
+    cm = np.zeros((N_CLASSES, N_CLASSES), dtype=np.int64)
+    tot, seen = 0.0, 0
+    for xb, yb in loader:
+        xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+        logits = model(xb)
+        tot += loss_fn(logits, yb).item() * xb.size(0)
+        seen += xb.size(0)
+        cm += confusion_matrix(yb.cpu().numpy(), logits.argmax(1).cpu().numpy())
+    iou = iou_from_cm(cm)
+    return {'loss': tot / seen, 'pixel_acc': pixel_accuracy(cm), 'iou': iou,
+            'miou': float(np.nanmean(iou)), 'cm': cm}
+
+
+EPOCHS = 15
+set_seed(0)
+model = UNet(base=16).to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+
+history = {'train_loss': [], 'val_loss': [], 'miou': [], 'fg_iou': [], 'pixel_acc': []}
+print(f'{"ep":>3} {"train":>9} {"val":>9} {"pix_acc":>8} {"mIoU":>7} {"fg IoU":>7}')
+for ep in range(EPOCHS):
+    tr = train_epoch(model, train_loader, optimizer, combined_loss, scheduler)
+    m = evaluate_seg(model, val_loader, combined_loss)
+    history['train_loss'].append(tr); history['val_loss'].append(m['loss'])
+    history['miou'].append(m['miou']); history['fg_iou'].append(float(m['iou'][1]))
+    history['pixel_acc'].append(m['pixel_acc'])
+    if ep % 3 == 0 or ep == EPOCHS - 1:
+        print(f'{ep:3d} {tr:9.4f} {m["loss"]:9.4f} {m["pixel_acc"]:8.4f} {m["miou"]:7.4f} {m["iou"][1]:7.4f}')
+
+best_fg = max(history['fg_iou'])
+assert best_fg > 0.80
+print(f'\nPASS  best foreground IoU {best_fg:.4f}')
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.6))
+axes[0].plot(history['train_loss'], marker='.', label='train')
+axes[0].plot(history['val_loss'], marker='.', label='val'); axes[0].set_ylabel('CE + Dice')
+axes[1].plot(history['pixel_acc'], marker='.', label='pixel acc')
+axes[1].plot(history['miou'], marker='.', label='mIoU')
+axes[1].plot(history['fg_iou'], marker='.', label='foreground IoU')
+axes[1].set_ylabel('metric')
+for ax in axes:
+    ax.set_xlabel('epoch'); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+plt.tight_layout()
+
+print(f'\npixel accuracy   epoch 0: {history["pixel_acc"][0]:.4f} -> final {history["pixel_acc"][-1]:.4f}')
+print(f'foreground IoU   epoch 0: {history["fg_iou"][0]:.4f} -> final {history["fg_iou"][-1]:.4f}')
+
+#%% md
+### What pixel accuracy alone would have told you
+
+Almost nothing. It starts around 0.90 - because 90% of pixels are background and the model gets
+those right immediately - and creeps to ~0.98. A 0.08 change over the whole run, most of it in the
+first epoch.
+
+Foreground IoU tells the real story: it starts near 0 and climbs to >0.85. **That's the learning.**
+
+From pixel accuracy alone you would plausibly conclude:
+
+- "the model is already 90% accurate at epoch 0, this task is easy" - it hasn't found a single blob
+- "training has converged, the curve is flat" - foreground IoU is still climbing steeply
+- "0.98 vs 0.97 between two models is a rounding error" - that gap can be 0.85 vs 0.70 in foreground
+  IoU, which is the difference between usable and useless
+
+This generalises past segmentation to every imbalanced problem: **pick the metric that moves when
+the thing you care about improves.** If your metric is nearly saturated before training starts, it
+is not measuring your task.
+
+#%% md
+---
+## Task 6 - Look at the predictions
+
+#%% code
+@torch.no_grad()
+def predict_mask(model, img_hwc):
+    model.eval()
+    x = torch.from_numpy(np.ascontiguousarray(img_hwc.transpose(2, 0, 1)))[None].to(device)
+    return model(x).argmax(1)[0].cpu().numpy()
+
+
+n_show = 5
+fig, axes = plt.subplots(4, n_show, figsize=(2.5 * n_show, 10))
+for col in range(n_show):
+    img, gt = val_ds.items[col + 5]
+    pred = predict_mask(model, img)
+    err = pred != gt
+    axes[0, col].imshow(img)
+    axes[1, col].imshow(gt, cmap='magma', vmin=0, vmax=1)
+    axes[2, col].imshow(pred, cmap='magma', vmin=0, vmax=1)
+    axes[3, col].imshow(err, cmap='Reds', vmin=0, vmax=1)
+    axes[0, col].set_title(f'fg IoU {iou_from_cm(confusion_matrix(gt, pred))[1]:.3f}', fontsize=9)
+    axes[3, col].set_xlabel(f'{100 * err.mean():.2f}% wrong', fontsize=8)
+for row, lab in enumerate(['image', 'ground truth', 'prediction', 'errors']):
+    axes[row, 0].set_ylabel(lab, fontsize=9)
+for ax in axes.ravel():
+    ax.set_xticks([]); ax.set_yticks([])
+plt.suptitle('predictions vs ground truth')
+plt.tight_layout()
+
+border_err, interior_err = [], []
+for img, gt in val_ds.items[:40]:
+    pred = predict_mask(model, img)
+    t = torch.from_numpy(gt)[None, None].float()
+    dil = F.max_pool2d(t, 5, stride=1, padding=2)
+    ero = -F.max_pool2d(-t, 5, stride=1, padding=2)
+    boundary = ((dil - ero)[0, 0].numpy() > 0)
+    err = pred != gt
+    border_err.append(err[boundary].mean() if boundary.sum() else np.nan)
+    interior_err.append(err[~boundary].mean())
+print(f'\nerror rate on boundary pixels (within 2px of an edge): {100 * np.nanmean(border_err):.2f}%')
+print(f'error rate elsewhere:                                   {100 * np.nanmean(interior_err):.2f}%')
+print(f'-> boundaries are about {np.nanmean(border_err) / max(np.nanmean(interior_err), 1e-9):.0f}x harder')
+
+#%% md
+### Where the errors are, and why
+
+**On the boundaries**, by an order of magnitude or more - the measurement above quantifies it. Three
+reasons, all structural:
+
+1. **Genuine ambiguity.** A pixel straddling the edge of a blob is partly both. The label forces a
+   binary choice that the image doesn't actually support. Antialiasing in the rendering makes this
+   literally true here, and on real photos it's worse.
+2. **Resolution loss in the encoder.** The bottleneck sees 24x24 for a 96x96 input. One bottleneck
+   pixel covers a 4x4 input region, so boundary position has to be recovered from the skip
+   connections. That is exactly what they're for, and it's why the no-skip ablation in task 7 hurts
+   boundaries most.
+3. **The loss barely cares.** Boundary pixels are a small fraction of the total, so CE - a per-pixel
+   sum - is nearly indifferent to them. Interior pixels dominate the gradient.
+
+Which is why **IoU is the right metric**: it's sensitive precisely to boundary quality, because
+shrinking or growing a mask by a couple of pixels changes the intersection and union measurably
+while barely moving pixel accuracy.
+
+If boundary quality is what you need, the standard tools are: **boundary-weighted loss** (upweight
+pixels near edges - the original U-Net paper did this for touching cells), **Dice** (a ratio, so
+proportionally more sensitive to small objects and thin structures), a **higher output resolution**
+(fewer pooling levels, or dilated convolution), and post-processing such as CRFs (largely
+superseded).
+
+Also worth checking, and visible in the plots: the model correctly ignores the **dim distractor
+blobs**. It learned brightness, not just "blob-shaped thing" - which is the right answer for this
+dataset, and the sort of thing you only confirm by looking.
+
+#%% md
+---
+## Task 7 - Skip connection ablation
+
+#%% code
+def train_variant(use_skips, epochs=10):
+    set_seed(0)
+    m = UNet(base=16, use_skips=use_skips).to(device)
+    opt = torch.optim.AdamW(m.parameters(), lr=3e-3, weight_decay=1e-4)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    ious = []
+    for ep in range(epochs):
+        train_epoch(m, train_loader, opt, combined_loss, sch)
+        ious.append(float(evaluate_seg(m, val_loader, combined_loss)['iou'][1]))
+    return m, ious
+
+
+m_skip, iou_skip = train_variant(True)
+m_noskip, iou_noskip = train_variant(False)
+assert sum(p.numel() for p in m_skip.parameters()) == sum(p.numel() for p in m_noskip.parameters())
+print(f'with skips    final fg IoU {iou_skip[-1]:.4f}')
+print(f'without skips final fg IoU {iou_noskip[-1]:.4f}')
+print(f'PASS  skips worth {iou_skip[-1] - iou_noskip[-1]:+.4f}')
+
+fig, axes = plt.subplots(1, 4, figsize=(13, 3.2))
+axes[0].plot(iou_skip, marker='o', label=f'with skips ({iou_skip[-1]:.3f})')
+axes[0].plot(iou_noskip, marker='s', label=f'no skips ({iou_noskip[-1]:.3f})')
+axes[0].set_xlabel('epoch'); axes[0].set_ylabel('foreground IoU')
+axes[0].legend(fontsize=8); axes[0].grid(alpha=0.3); axes[0].set_title('ablation')
+img, gt = val_ds.items[2]
+axes[1].imshow(gt, cmap='magma', vmin=0, vmax=1); axes[1].set_title('ground truth', fontsize=9)
+axes[2].imshow(predict_mask(m_skip, img), cmap='magma', vmin=0, vmax=1)
+axes[2].set_title('with skips', fontsize=9)
+axes[3].imshow(predict_mask(m_noskip, img), cmap='magma', vmin=0, vmax=1)
+axes[3].set_title('no skips', fontsize=9)
+for ax in axes[1:]: ax.axis('off')
+plt.tight_layout()
+
+#%% md
+### What the skips are doing
+
+Without them, the decoder must reconstruct every boundary from a 24x24 feature map. It cannot - the
+information is gone. The predictions come out rounded, slightly displaced, and blobby, while the
+*semantic* decision ("there is a bright thing roughly here") is usually still right.
+
+That's the diagnostic worth memorising: **right location, wrong boundaries -> your skips are missing
+or wrong.** Common real causes are concatenating the wrong encoder stage, resizing the skip instead
+of the upsampled tensor, or an off-by-one in the level indices.
+
+Two more things the skips do, less obviously:
+
+- **Gradient highway.** Early encoder layers get gradient directly from the output, not only through
+  the bottleneck. Same mechanism as ResNet's residual connections, and it's why U-Nets train fast.
+- **Multi-scale by construction.** Each decoder level sees features at its own resolution *and*
+  coarser semantics from below, so the network doesn't have to pick one scale.
+
+This is also why the U-Net turns up far outside segmentation - it's the denoising backbone of
+diffusion models, where the same "keep fine detail, add global context" requirement applies.
+
+#%% md
+---
+## Task 8 - Class weighting
+
+#%% code
+def class_weights_from_masks(masks, k=N_CLASSES):
+    counts = np.bincount(np.asarray(masks).ravel(), minlength=k).astype(np.float64)
+    freq = counts / counts.sum()
+    w = 1.0 / np.maximum(freq, 1e-8)          # inverse frequency
+    w = w / w.mean()                          # normalize so the mean weight is 1
+    return torch.tensor(w, dtype=torch.float32)
+
+
+train_masks = np.stack([m for _, m in train_ds_raw.items])
+w = class_weights_from_masks(train_masks)
+freq = np.bincount(train_masks.ravel(), minlength=N_CLASSES) / train_masks.size
+print(f'frequencies {np.round(freq, 4)} -> weights {np.round(w.numpy(), 4)}')
+
+def train_ce_variant(weight, epochs=10, label=''):
+    set_seed(0)
+    m = UNet(base=16).to(device)
+    loss_fn = nn.CrossEntropyLoss(weight=None if weight is None else weight.to(device))
+    opt = torch.optim.AdamW(m.parameters(), lr=3e-3, weight_decay=1e-4)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    best = 0.0
+    for ep in range(epochs):
+        train_epoch(m, train_loader, opt, loss_fn, sch)
+        best = max(best, float(evaluate_seg(m, val_loader, loss_fn)['iou'][1]))
+    print(f'  {label:14} best fg IoU {best:.4f}')
+    return best
+
+print('\n10 epochs each, plain CE only (no Dice, so the weighting effect is visible):')
+fg_plain = train_ce_variant(None, label='plain CE')
+fg_weighted = train_ce_variant(w, label='weighted CE')
+print(f'\ndifference {fg_weighted - fg_plain:+.4f}')
+
+#%% md
+### Did weighting help?
+
+Usually only slightly here, and it can even be marginally worse. Both are informative results, and
+the reasons are worth knowing.
+
+**Why the effect is small on this dataset.** The foreground is bright and visually unambiguous, so
+even unweighted CE finds it easily - the imbalance never actually starves the minority class of
+gradient. Class weighting pays off when the rare class is *also hard*: thin structures, faint
+lesions, small distant objects. Imbalance alone isn't sufficient reason to reach for it.
+
+**What weighting actually does.** It multiplies each pixel's loss by its class weight, so a
+foreground pixel counts ~9x a background pixel here. That shifts the model's operating point toward
+**recall** at the cost of **precision** - it over-predicts foreground, masks grow, false positives
+rise. If IoU was already balanced, that trade can reduce it. Check the confusion matrix, not just
+the headline number, to see which way you moved.
+
+**Alternatives, roughly in the order I'd try them:**
+
+1. **Dice loss** - handles imbalance structurally, because it's a ratio per class rather than a sum
+   over pixels. Usually a better first move than weighting.
+2. **`CE + Dice`** - the standard default, and what the main training run used.
+3. **Focal loss** - down-weights *easy* pixels rather than *frequent* classes:
+   $(1-p_t)^\gamma$ scaling. Targets difficulty, which is often the real problem.
+4. **Milder weights** - $1/\sqrt{\text{freq}}$ or `median_freq / freq` instead of `1/freq`. Raw
+   inverse frequency is aggressive and destabilises training on datasets with 50+ classes.
+5. **`ignore_index`** for genuinely ambiguous pixels, rather than weighting around them.
+
+**Two things to get right if you do use weights:** compute them from the **training** split only
+(chapter 2's leakage rule), and move the tensor to the model's device or you get a device-mismatch
+error on the first backward pass.
+
+**The general lesson.** "The dataset is imbalanced, so weight the classes" is a reflex, not a
+diagnosis. Measure whether imbalance is actually hurting - look at per-class IoU and at the
+confusion matrix - then pick the tool that addresses what you found.
+
+#%% md
+---
+## That's the course
+
+You built, from scratch: gradient descent, convolution, a training loop, a CNN, a fine-tuned
+transfer model, and a U-Net. More importantly you now have the habits:
+
+1. **Look at the data, look at the predictions.** Plot them. Bugs die on contact with a figure.
+2. **Overfit one batch** before any real run. It separates bugs from tuning.
+3. **Pick a metric that moves** when the thing you care about improves.
+4. **Ablate** to find out what actually helps, instead of guessing.
+5. **Check the shapes and dtypes** - most silent bugs are a broadcast or a cast you didn't intend.
+
+Where to go next is at the end of [`docs/06_segmentation.md`](../../docs/06_segmentation.md). The
+short version: object detection next, and note that the U-Net you just wrote is the core of modern
+diffusion models - almost unchanged.

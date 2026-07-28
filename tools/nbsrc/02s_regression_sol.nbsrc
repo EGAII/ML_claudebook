@@ -1,0 +1,544 @@
+#out exercises/solutions/sol02_regression.ipynb
+#gpu off
+
+#%% md
+# Solutions 2 - Regression, gradient descent, autograd
+
+Answers to [`ex02_regression.ipynb`](../ex02_regression.ipynb), with the reasoning.
+
+#%% code
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+
+plt.rcParams['figure.dpi'] = 110
+rng = np.random.default_rng(0)
+torch.manual_seed(0)
+
+TRUE_W = np.array([2.0, -3.0], dtype=np.float64)
+TRUE_B = 0.5
+N = 200
+Xreg = rng.uniform(-2, 2, size=(N, 2))
+yreg = Xreg @ TRUE_W + TRUE_B + rng.normal(0, 0.3, size=N)
+
+def make_blobs(n=400, seed=1):
+    r = np.random.default_rng(seed)
+    n0 = n // 2
+    a = r.normal([-1.3, -0.5], [1.0, 0.9], size=(n0, 2))
+    b = r.normal([1.4, 0.9], [1.0, 0.9], size=(n - n0, 2))
+    X = np.vstack([a, b]).astype(np.float32)
+    y = np.concatenate([np.zeros(n0), np.ones(n - n0)]).astype(np.float32)
+    i = r.permutation(n)
+    return X[i], y[i]
+
+Xc, yc = make_blobs()
+ncut = int(0.75 * len(Xc))
+Xc_tr, Xc_va, yc_tr, yc_va = Xc[:ncut], Xc[ncut:], yc[:ncut], yc[ncut:]
+
+from sklearn.datasets import load_digits
+_d = load_digits()
+_perm = np.random.default_rng(0).permutation(len(_d.data))
+Xd = _d.data.astype(np.float32)[_perm]
+yd = _d.target.astype(np.int64)[_perm]
+_ntr = int(0.8 * len(Xd))
+Xd_tr, Xd_va, yd_tr, yd_va = Xd[:_ntr], Xd[_ntr:], yd[:_ntr], yd[_ntr:]
+mu, sd = Xd_tr.mean(0), Xd_tr.std(0) + 1e-6
+Xd_tr_s, Xd_va_s = (Xd_tr - mu) / sd, (Xd_va - mu) / sd
+print('setup ok')
+
+#%% md
+---
+## Task 1 - MSE and its gradient
+
+#%% code
+def predict(X, w, b):
+    return X @ w + b
+
+def mse_loss(X, y, w, b):
+    return float(np.mean((predict(X, w, b) - y) ** 2))
+
+def mse_grad(X, y, w, b):
+    n = len(y)
+    r = predict(X, w, b) - y               # (N,)
+    return (2.0 / n) * (X.T @ r), (2.0 / n) * float(r.sum())
+
+
+w_test = np.array([0.3, 0.9]); b_test = -0.2
+dw, db = mse_grad(Xreg, yreg, w_test, b_test)
+eps = 1e-6
+dw_num = np.array([(mse_loss(Xreg, yreg, w_test + eps * e, b_test) -
+                    mse_loss(Xreg, yreg, w_test - eps * e, b_test)) / (2 * eps) for e in np.eye(2)])
+db_num = (mse_loss(Xreg, yreg, w_test, b_test + eps) - mse_loss(Xreg, yreg, w_test, b_test - eps)) / (2 * eps)
+assert np.allclose(dw, dw_num, atol=1e-4) and abs(db - db_num) < 1e-4
+print('PASS  dw', dw.round(4), 'db', round(db, 4))
+
+#%% md
+### Why this way
+
+**The derivation.** With $r = Xw + b - y$ and $L = \frac{1}{N}\sum r_i^2$:
+
+$$\frac{\partial L}{\partial w_j} = \frac{1}{N}\sum_i 2 r_i \frac{\partial r_i}{\partial w_j}
+= \frac{2}{N}\sum_i r_i X_{ij} \quad\Longrightarrow\quad \nabla_w L = \frac{2}{N} X^\top r$$
+
+Read the last step as: chain rule per element, then recognise the sum-over-samples as a
+matrix-vector product. That recognition is what makes backprop feel obvious later.
+
+**`X.T @ r` and not `X @ r`.** Shapes settle it: `X` is `(N, D)`, `r` is `(N,)`. Only
+`X.T @ r` is defined, and it gives `(D,)` - the shape of `w`. **The gradient always has the
+shape of the parameter it belongs to.** Make that your reflex check.
+
+**The factor 2** comes from differentiating the square. People sometimes define MSE with a
+$\frac{1}{2N}$ to cancel it; both are fine, but if you mix the loss from one convention with
+the gradient from the other, your effective learning rate is off by 2x and you'll blame the
+optimizer.
+
+**Why check numerically.** The central difference
+$\frac{L(\theta+\epsilon) - L(\theta-\epsilon)}{2\epsilon}$ is accurate to $O(\epsilon^2)$,
+versus $O(\epsilon)$ for the one-sided version - much better for the same effort. Use
+`eps` around `1e-6` in float64: too large and you measure curvature, too small and you drown
+in floating-point cancellation. (In float32, `1e-3` is a better choice.)
+
+#%% md
+---
+## Task 2 - Gradient descent
+
+#%% code
+def gradient_descent(X, y, lr=0.1, epochs=300):
+    w = np.zeros(X.shape[1]); b = 0.0
+    losses = []
+    for _ in range(epochs):
+        losses.append(mse_loss(X, y, w, b))
+        dw, db = mse_grad(X, y, w, b)
+        w = w - lr * dw
+        b = b - lr * db
+    return w, b, losses
+
+
+w_gd, b_gd, losses = gradient_descent(Xreg, yreg, lr=0.1, epochs=300)
+assert np.allclose(w_gd, TRUE_W, atol=0.05) and abs(b_gd - TRUE_B) < 0.05
+print(f'PASS  w = {w_gd.round(4)}  b = {b_gd:.4f}  loss {losses[-1]:.4f}')
+
+plt.figure(figsize=(5, 3))
+plt.plot(losses); plt.yscale('log'); plt.xlabel('epoch'); plt.ylabel('MSE'); plt.grid(alpha=0.3)
+
+#%% md
+### Why this way
+
+**`w = w - lr * dw`, not `w -= lr * dw`.** Here they're equivalent because `dw` is a fresh
+array. But `-=` mutates in place, and if `w` were a view into something else (or a tensor you
+also needed the old value of), in-place would bite. In NumPy the rebinding form is the safer
+default; in PyTorch you *want* in-place inside `no_grad()` so the optimizer keeps the same
+parameter object.
+
+**Log the loss before the update, not after.** `losses[0]` is then the loss at initialization,
+so the curve starts where the model actually started. Logging after the step gives you an
+off-by-one that makes epoch 0 look magically good.
+
+**The loss can't go below the noise floor.** We added `N(0, 0.3)` noise, so the best possible
+MSE is about $0.3^2 = 0.09$. If you find yourself tuning to get below that, you're chasing
+noise - which is another way of saying you're overfitting.
+
+#%% md
+---
+## Task 3 - Closed form
+
+#%% code
+def normal_equation(X, y):
+    X_aug = np.hstack([X, np.ones((len(X), 1))])
+    theta, *_ = np.linalg.lstsq(X_aug, y, rcond=None)
+    return theta[:-1], float(theta[-1])
+
+
+w_ex, b_ex = normal_equation(Xreg, yreg)
+loss_ex = mse_loss(Xreg, yreg, w_ex, b_ex)
+assert loss_ex <= mse_loss(Xreg, yreg, w_gd, b_gd) + 1e-9
+assert mse_loss(Xreg, yreg, w_gd, b_gd) - loss_ex < 1e-3
+print(f'PASS  closed form w = {w_ex.round(4)} b = {b_ex:.4f} loss {loss_ex:.6f}')
+
+ill = np.stack([Xreg[:, 0], Xreg[:, 0] + 1e-8 * rng.normal(size=N)], axis=1)
+ill_aug = np.hstack([ill, np.ones((N, 1))])
+print('cond(X) =', f'{np.linalg.cond(ill_aug):.2e}')
+w_ls, *_ = np.linalg.lstsq(ill_aug, yreg, rcond=None)
+print('lstsq   ->', w_ls.round(3), '(finite, sane)')
+try:
+    w_inv = np.linalg.inv(ill_aug.T @ ill_aug) @ ill_aug.T @ yreg
+    print('inv     ->', w_inv.round(3), '<- huge / meaningless coefficients')
+except np.linalg.LinAlgError as e:
+    print('inv     -> LinAlgError:', e)
+
+#%% md
+### Why this way
+
+**The bias-as-a-column trick.** Appending a column of ones to $X$ turns $Xw + b$ into a pure
+matrix product, so one `lstsq` call solves for weights and bias together. That's exactly why
+`nn.Linear` has a `bias` parameter rather than making you concatenate ones yourself.
+
+**Why `lstsq` and not `inv(X.T @ X) @ X.T @ y`.** Forming $X^\top X$ **squares the condition
+number** of the problem. With `cond(X) ~ 1e8`, `cond(X.T @ X) ~ 1e16`, which is the entire
+precision budget of float64 - the inverse is then numerically meaningless. `lstsq` uses an
+SVD-based solve on $X$ directly and never squares anything. The rule generalises: *never form
+a matrix inverse when a solver will do*.
+
+**`rcond=None`** opts into the modern default (small singular values are truncated relative
+to machine precision) instead of the legacy behaviour, which is what the deprecation warning
+is nagging about.
+
+**Why keep a closed form around at all**, given that no real model has one? As a **unit test
+for your optimizer**. If GD lands 1e-6 away from the exact optimum, the optimizer works and
+any remaining error is model bias or data noise. If it lands 10x off, the bug is in your loop.
+Separating "optimization failure" from "model failure" is half of debugging.
+
+#%% md
+---
+## Task 4 - Autograd against calculus
+
+#%% code
+def autograd_grad(values):
+    w = torch.tensor(values, requires_grad=True)
+    f = (w ** 3 - 4 * w).sum()          # must be a SCALAR to call .backward()
+    f.backward()
+    return w.grad
+
+
+VALUES = [1.0, 2.0, -1.5]
+grad_auto = autograd_grad(VALUES)
+grad_manual = 3 * torch.tensor(VALUES) ** 2 - 4
+assert torch.allclose(grad_auto, grad_manual, atol=1e-5)
+print('PASS  autograd', grad_auto.tolist(), '== formula', grad_manual.tolist())
+
+#%% md
+### Why `w.grad` is `None` before `.backward()`
+
+Because nothing has been backpropagated into it yet. `.grad` is a **storage slot**, not a
+computed property: it is `None` until some `.backward()` call accumulates a value into it.
+Reading it early gives `None`, and `None * lr` raises - which is the usual way people discover
+they forgot the backward pass.
+
+Three related facts worth having straight:
+
+- **Only leaves get `.grad`.** `w` is a leaf (you created it with `requires_grad=True`).
+  Intermediates like `w ** 3` compute gradients during the backward pass but discard them.
+  If you need one, use `retain_grad()` or a hook.
+- **The graph is freed after `.backward()`.** Calling `.backward()` twice on the same graph
+  raises "Trying to backward through the graph a second time". Pass
+  `retain_graph=True` if you genuinely need it (multi-loss setups), but usually the real fix
+  is to recompute the forward pass.
+- **`.sum()` vs `.mean()`.** Both give a scalar, but `.mean()` divides the gradient by `N`.
+  With `.sum()`, doubling your batch size doubles your gradient magnitude and effectively
+  doubles your learning rate. That's why losses default to `reduction='mean'`.
+
+#%% md
+---
+## Task 5 - The three bugs
+
+```python
+logits = model(Xtr_t)
+probs = torch.softmax(logits, dim=1)
+loss = criterion(probs, ytr_t)     # BUG 1: CrossEntropyLoss already applies log_softmax
+loss.backward()                     # BUG 2: no optimizer.zero_grad() -> gradients accumulate
+optimizer.step()
+history.append(loss)                # BUG 3: appends the tensor, keeping the whole graph alive
+```
+
+**Bug 1 - double softmax.** `nn.CrossEntropyLoss` = `log_softmax` + `nll_loss`. Feeding it
+probabilities applies softmax twice, which squashes the already-normalized values into a
+narrow range near $1/C$. The gradients get tiny and the model learns slowly and badly. It
+never raises an error, which is what makes it so nasty. Same trap: `sigmoid` before
+`BCEWithLogitsLoss`.
+
+**Bug 2 - missing `zero_grad()`.** Gradients *accumulate* into `.grad`. By epoch 50 the
+gradient is the sum of 50 epochs' worth, so the effective step size grows without bound -
+the loss oscillates or explodes to `nan`. This is the most common training bug in PyTorch,
+full stop.
+
+**Bug 3 - appending the tensor.** `history.append(loss)` stores a tensor that still references
+its computation graph, so every epoch's activations stay in memory. On a real model this is an
+OOM, and it's a slow memory leak that grows linearly with epochs. Always `.item()` (or
+`.detach()`) before logging.
+
+Bonus, not counted but write it anyway: no `model.train()` / `model.eval()`. It's a no-op for
+a bare `nn.Linear`, but the moment you add dropout or batch norm it becomes a real bug, and by
+then you won't remember to add it.
+
+#%% code
+def train_buggy(Xtr, ytr, Xva, yva, epochs=150, lr=0.1):
+    Xtr_t = torch.from_numpy(Xtr); ytr_t = torch.from_numpy(ytr)
+    Xva_t = torch.from_numpy(Xva); yva_t = torch.from_numpy(yva)
+    torch.manual_seed(0)
+    model = nn.Linear(Xtr.shape[1], 10)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    history = []
+    for epoch in range(epochs):
+        logits = model(Xtr_t)
+        probs = torch.softmax(logits, dim=1)
+        loss = criterion(probs, ytr_t)
+        loss.backward()
+        optimizer.step()
+        history.append(loss)
+    model.eval()
+    with torch.no_grad():
+        acc = (model(Xva_t).argmax(1) == yva_t).float().mean().item()
+    return model, history, acc
+
+
+def train_fixed(Xtr, ytr, Xva, yva, epochs=150, lr=0.1):
+    Xtr_t = torch.from_numpy(Xtr); ytr_t = torch.from_numpy(ytr)
+    Xva_t = torch.from_numpy(Xva); yva_t = torch.from_numpy(yva)
+    torch.manual_seed(0)
+    model = nn.Linear(Xtr.shape[1], 10)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+
+    history = []
+    for epoch in range(epochs):
+        model.train()
+        optimizer.zero_grad()               # fix 2
+        logits = model(Xtr_t)
+        loss = criterion(logits, ytr_t)     # fix 1: raw logits
+        loss.backward()
+        optimizer.step()
+        history.append(loss.item())         # fix 3
+
+    model.eval()
+    with torch.no_grad():
+        acc = (model(Xva_t).argmax(1) == yva_t).float().mean().item()
+    return model, history, acc
+
+
+_, _, acc_buggy = train_buggy(Xd_tr_s, yd_tr, Xd_va_s, yd_va)
+model_fixed, hist_fixed, acc_fixed = train_fixed(Xd_tr_s, yd_tr, Xd_va_s, yd_va)
+print(f'buggy val accuracy {acc_buggy:.4f}')
+print(f'fixed val accuracy {acc_fixed:.4f}')
+print(f'fixed loss {hist_fixed[0]:.4f} -> {hist_fixed[-1]:.4f}')
+assert acc_fixed > 0.92 and isinstance(hist_fixed[0], float)
+print('PASS')
+
+plt.figure(figsize=(5, 3))
+plt.plot(hist_fixed); plt.xlabel('epoch'); plt.ylabel('cross-entropy'); plt.grid(alpha=0.3)
+plt.title('fixed loop')
+
+#%% code
+print('isolating each bug (fix the other two, keep one):')
+
+def train_variant(bug=None, epochs=150, lr=0.1):
+    Xtr_t = torch.from_numpy(Xd_tr_s); ytr_t = torch.from_numpy(yd_tr)
+    Xva_t = torch.from_numpy(Xd_va_s); yva_t = torch.from_numpy(yd_va)
+    torch.manual_seed(0)
+    model = nn.Linear(64, 10)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    for epoch in range(epochs):
+        if bug != 'no_zero_grad':
+            optimizer.zero_grad()
+        logits = model(Xtr_t)
+        inp = torch.softmax(logits, dim=1) if bug == 'double_softmax' else logits
+        loss = criterion(inp, ytr_t)
+        loss.backward()
+        optimizer.step()
+    model.eval()
+    with torch.no_grad():
+        return (model(Xva_t).argmax(1) == yva_t).float().mean().item(), loss.item()
+
+for bug in [None, 'double_softmax', 'no_zero_grad']:
+    acc, final = train_variant(bug)
+    name = 'all fixed' if bug is None else f'only bug: {bug}'
+    print(f'  {name:26} val acc {acc:.4f}  final loss {final:.4f}')
+print('\nNeither bug raises an exception. Both just quietly cost you accuracy.')
+
+#%% md
+---
+## Task 6 - Binary logistic regression
+
+#%% code
+def train_logreg(Xtr, ytr, epochs=300, lr=0.5):
+    torch.manual_seed(0)
+    Xt = torch.from_numpy(Xtr)
+    yt = torch.from_numpy(ytr)[:, None]          # (N,) -> (N, 1) to match the logits
+    model = nn.Linear(2, 1)
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    for _ in range(epochs):
+        model.train()
+        optimizer.zero_grad()
+        loss = criterion(model(Xt), yt)
+        loss.backward()
+        optimizer.step()
+    return model
+
+
+def predict(model, X):
+    model.eval()
+    with torch.no_grad():
+        logits = model(torch.from_numpy(np.ascontiguousarray(X, dtype=np.float32)))
+    return (logits.squeeze(1) > 0).long().numpy()
+
+
+def accuracy(y_true, y_pred):
+    return float((np.asarray(y_true).ravel().astype(int) == np.asarray(y_pred).ravel().astype(int)).mean())
+
+
+logreg = train_logreg(Xc_tr, yc_tr)
+pred_va = predict(logreg, Xc_va)
+acc = accuracy(yc_va, pred_va)
+assert pred_va.shape == (len(yc_va),) and set(np.unique(pred_va)) <= {0, 1} and acc > 0.90
+print(f'PASS  val accuracy {acc:.4f} | w {logreg.weight.detach().numpy().round(3)} b {logreg.bias.item():.3f}')
+
+#%% md
+### Why this way
+
+**`(logits > 0)` needs no sigmoid.** Sigmoid is monotonically increasing with
+$\sigma(0) = 0.5$, so `sigmoid(z) > 0.5` and `z > 0` select exactly the same samples. Skipping
+it saves a kernel launch and, more importantly, avoids the habit of materialising
+probabilities you don't need. Compute `sigmoid` only when you want a *calibrated probability*
+to show a user or threshold at something other than 0.5.
+
+**`ytr[:, None]` - shape, not style.** `BCEWithLogitsLoss` needs target and input to have the
+same shape. Model output is `(N, 1)`; a target of `(N,)` would **broadcast** to `(N, N)` and
+compute a loss over all $N^2$ pairs. It runs. It's wrong. The loss looks plausible and the
+model learns nothing useful. Modern PyTorch warns here - read that warning.
+
+**`.squeeze(1)` not `.squeeze()`.** With batch size 1, a bare `squeeze()` would remove the
+batch dimension too and turn `(1, 1)` into a 0-d tensor. Always name the axis you mean.
+
+**Binary problems: 1 output or 2?** `nn.Linear(2, 1)` + `BCEWithLogitsLoss`, or
+`nn.Linear(2, 2)` + `CrossEntropyLoss`. Both work and give nearly identical results; the
+1-logit version has fewer parameters and is the convention for binary tasks (and for
+multi-*label* problems, where each class gets its own independent sigmoid).
+
+#%% md
+---
+## Task 7 - Confusion matrix and per-class recall
+
+#%% code
+def confusion_matrix(y_true, y_pred, k=10):
+    y_true = np.asarray(y_true).ravel().astype(np.int64)
+    y_pred = np.asarray(y_pred).ravel().astype(np.int64)
+    return np.bincount(y_true * k + y_pred, minlength=k * k).reshape(k, k)
+
+
+def per_class_recall(cm):
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return np.where(cm.sum(1) > 0, np.diag(cm) / np.maximum(cm.sum(1), 1), np.nan)
+
+
+with torch.no_grad():
+    val_pred = model_fixed(torch.from_numpy(Xd_va_s)).argmax(1).numpy()
+
+cm = confusion_matrix(yd_va, val_pred, k=10)
+rec = per_class_recall(cm)
+assert cm.shape == (10, 10) and cm.sum() == len(yd_va)
+assert np.allclose(cm.sum(1), np.bincount(yd_va, minlength=10))
+print('PASS  accuracy from the matrix:', round(float(np.diag(cm).sum() / cm.sum()), 4))
+print('per-class recall:', {i: round(float(v), 3) for i, v in enumerate(rec)})
+off = cm.copy(); np.fill_diagonal(off, 0)
+i, j = np.unravel_index(off.argmax(), off.shape)
+print(f'worst class {int(np.nanargmin(rec))} | most confused: true {i} -> pred {j} ({off[i, j]}x)')
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+axes[0].imshow(cm, cmap='Blues'); axes[0].set_title('counts')
+norm = cm / np.maximum(cm.sum(1, keepdims=True), 1)
+im = axes[1].imshow(norm, cmap='Blues', vmin=0, vmax=1); axes[1].set_title('row-normalized (recall on the diagonal)')
+for ax in axes:
+    ax.set_xlabel('predicted'); ax.set_ylabel('actual'); ax.set_xticks(range(10)); ax.set_yticks(range(10))
+fig.colorbar(im, ax=axes[1], shrink=0.8)
+plt.tight_layout()
+
+#%% md
+### Why this way
+
+**The `bincount` trick.** Flatten the pair `(true, pred)` into a single integer
+`true * k + pred`, count occurrences, reshape to `(k, k)`. One pass, no Python loop, and it
+scales to the millions of pixels you'll feed it in chapter 6. A double `for` loop over classes
+with boolean masks is `k^2` passes over the data; this is one.
+
+**Rows actual, columns predicted** is the scikit-learn convention. Follow it, because everyone
+reading your plot will assume it. Consequences:
+
+- `cm.sum(axis=1)` = how many of each class actually exist -> denominator of **recall**.
+- `cm.sum(axis=0)` = how many of each class you predicted -> denominator of **precision**.
+- `np.diag(cm).sum() / cm.sum()` = accuracy.
+
+**Row-normalize before you interpret.** In the raw counts a bright cell might just be a common
+class. The right-hand plot divides by row sums, so the diagonal *is* per-class recall and every
+row is comparable. Chapter 6 does exactly this with IoU.
+
+**Guard the division.** A class absent from the validation set has row sum 0. `np.nan` (with
+`np.nanmean` downstream) is honest; `0.0` would silently drag your macro-average down and make
+you think the model failed on a class it was never shown.
+
+#%% md
+---
+## Task 8 - Scaling
+
+#%% code
+def train_and_final_loss(Xtr, ytr, Xva, yva, epochs=100, lr=0.05, seed=0):
+    torch.manual_seed(seed)
+    Xt = torch.from_numpy(np.ascontiguousarray(Xtr, dtype=np.float32))
+    yt = torch.from_numpy(ytr)
+    Xv = torch.from_numpy(np.ascontiguousarray(Xva, dtype=np.float32))
+    yv = torch.from_numpy(yva)
+    model = nn.Linear(Xtr.shape[1], 10)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    for _ in range(epochs):
+        model.train()
+        optimizer.zero_grad()
+        loss = criterion(model(Xt), yt)
+        loss.backward()
+        optimizer.step()
+    model.eval()
+    with torch.no_grad():
+        acc = (model(Xv).argmax(1) == yv).float().mean().item()
+    return loss.item(), acc
+
+
+loss_raw, acc_raw = train_and_final_loss(Xd_tr, yd_tr, Xd_va, yd_va)
+loss_std, acc_std = train_and_final_loss(Xd_tr_s, yd_tr, Xd_va_s, yd_va)
+print(f'raw pixels   final loss {loss_raw:.4f}  val acc {acc_raw:.4f}')
+print(f'standardized final loss {loss_std:.4f}  val acc {acc_std:.4f}')
+assert np.isfinite(loss_std)
+print('PASS')
+
+#%% md
+### Why train-split statistics only
+
+Because $\mu$ and $\sigma$ computed over train+val encode information about the validation
+set into your preprocessing. Your validation score then measures performance on data you
+partly used - it's optimistically biased, and the bias is invisible.
+
+The rule is mechanical and worth internalising: **anything fitted on data must be fitted on
+train only**, then *applied* unchanged to val/test. That covers normalization statistics,
+PCA bases, vocabularies, class weights, imputation values, and target encodings. In
+scikit-learn terms: `fit` on train, `transform` everywhere. Leakage through preprocessing is
+the most common reason a model that scored 0.95 in a notebook scores 0.80 in production.
+
+Two practical footnotes:
+
+- With images you'll usually just reuse the **ImageNet** statistics
+  (`mean=[0.485,0.456,0.406]`, `std=[0.229,0.224,0.225]`) when fine-tuning a pretrained model -
+  they're the constants the pretrained weights were fitted with, so using your own would put
+  the inputs in a different range than the network expects (chapter 5).
+- `+1e-6` on the denominator matters: a border pixel that is 0 in every training image has
+  `sd == 0`, and dividing by it gives `inf`, then `nan` loss on the first step.
+
+#%% md
+---
+## The meta-lesson from task 5
+
+None of those three bugs raises an exception. That's the shape of most deep-learning bugs:
+**the code runs, the numbers look plausible, the model is just worse than it should be.**
+
+Defences, in order of how much they've saved me:
+
+1. **Overfit one batch first.** Take 8 samples and train until loss is ~0. If it can't, the
+   bug is in your loop, not your hyperparameters. Chapter 4 makes this a routine step.
+2. **Numerically check any gradient you write by hand.** Four lines, catches everything.
+3. **Know the shapes.** Print them. Most silent bugs are a broadcast you didn't intend.
+4. **Plot train and val loss every run.** The *shape* of the curves diagnoses more than any
+   single number.
+5. **Look at the data and the predictions.** Render the images with their labels; render the
+   confident mistakes. Bugs that survive the loss curve rarely survive a plot.
+
+Next: [Chapter 3 - Convolution](../../docs/03_convolution.md)

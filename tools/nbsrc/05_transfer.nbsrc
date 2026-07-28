@@ -1,0 +1,621 @@
+#out notebooks/05_transfer_learning.ipynb
+#gpu on
+
+#%% md
+# Chapter 5 - Transfer learning with a pretrained ResNet
+
+Companion to [`docs/05_transfer_learning.md`](../docs/05_transfer_learning.md).
+
+> **GPU: Runtime -> Change runtime type -> T4 GPU.** About 4 minutes total.
+
+Dataset: the classic **ants vs bees** set - 244 training images, 153 validation. That is a
+*tiny* dataset. From scratch you would get maybe 70%. With a pretrained backbone: ~95%, in
+under a minute.
+
+Along the way we:
+
+- look at what ImageNet actually taught the first layer (it learned chapter 3's Sobel filters),
+- compare **frozen backbone** vs **fine-tuning** vs **from scratch** on identical splits,
+- see catastrophic forgetting happen when the learning rate is wrong,
+- and use **Grad-CAM** to check the model is right for the right reason.
+
+#%% code
+import os, sys, time, copy, urllib.request, zipfile
+from pathlib import Path
+
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+import torchvision
+from torchvision import datasets, transforms, models
+
+print('torch', torch.__version__, '| torchvision', torchvision.__version__)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+if device.type != 'cuda':
+    print('\n*** NO GPU: Runtime -> Change runtime type -> T4 GPU, then Restart. ***')
+print('device', device)
+
+try:
+    import google.colab  # noqa: F401
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+ROOT = Path('/content' if IN_COLAB else '.')
+NUM_WORKERS = 2 if IN_COLAB else 0
+
+def set_seed(seed=0):
+    import random
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+set_seed(0)
+torch.backends.cudnn.benchmark = True
+plt.rcParams['figure.dpi'] = 110
+
+#%% md
+## 1. The data
+
+~47 MB, from the PyTorch tutorial servers. `ImageFolder` reads a directory tree where each
+subfolder name is a class - the simplest possible dataset format, and the one you should use for
+your own images.
+
+```
+hymenoptera_data/
+  train/ants/*.jpg    train/bees/*.jpg
+  val/ants/*.jpg      val/bees/*.jpg
+```
+
+#%% code
+URL = 'https://download.pytorch.org/tutorial/hymenoptera_data.zip'
+zip_path = ROOT / 'hymenoptera_data.zip'
+data_root = ROOT / 'hymenoptera_data'
+
+if not data_root.exists():
+    print('downloading', URL)
+    urllib.request.urlretrieve(URL, zip_path)
+    with zipfile.ZipFile(zip_path) as z:
+        z.extractall(ROOT)
+    print('extracted to', data_root)
+else:
+    print('already present:', data_root)
+
+for split in ['train', 'val']:
+    counts = {d.name: len(list(d.glob('*.jpg'))) for d in sorted((data_root / split).iterdir()) if d.is_dir()}
+    print(f'  {split}: {counts}  total {sum(counts.values())}')
+
+#%% code
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+train_tf = transforms.Compose([
+    transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),
+    transforms.RandomHorizontalFlip(),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+    transforms.ToTensor(),
+    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),      # ImageNet stats, NOT our dataset's
+])
+
+eval_tf = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+])
+
+train_ds = datasets.ImageFolder(data_root / 'train', train_tf)
+val_ds = datasets.ImageFolder(data_root / 'val', eval_tf)
+CLASSES = train_ds.classes
+
+train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=NUM_WORKERS,
+                          pin_memory=device.type == 'cuda')
+val_loader = DataLoader(val_ds, batch_size=64, shuffle=False, num_workers=NUM_WORKERS,
+                        pin_memory=device.type == 'cuda')
+
+print('classes    ', CLASSES, '(ImageFolder sorts folder names alphabetically)')
+print('train      ', len(train_ds), 'images in', len(train_loader), 'batches')
+print('val        ', len(val_ds), 'images')
+print('class_to_idx', train_ds.class_to_idx)
+
+x0, y0 = train_ds[0]
+print(f'\nsample: {tuple(x0.shape)} {x0.dtype} label {y0} = {CLASSES[y0]}')
+print('224x224 because that is what ImageNet models were trained on.')
+print(f'\nOnly {len(train_ds)} training images. A from-scratch CNN has no chance here.')
+
+#%% code
+def denormalize(t):
+    m = torch.tensor(IMAGENET_MEAN).view(-1, 1, 1)
+    s = torch.tensor(IMAGENET_STD).view(-1, 1, 1)
+    return (t.detach().cpu() * s + m).clamp(0, 1).permute(1, 2, 0).numpy()
+
+xb, yb = next(iter(train_loader))
+fig, axes = plt.subplots(2, 6, figsize=(13, 4.6))
+for ax, i in zip(axes.ravel(), range(12)):
+    ax.imshow(denormalize(xb[i])); ax.set_title(CLASSES[yb[i]], fontsize=9); ax.axis('off')
+plt.suptitle('training batch: random resized crops, flips, colour jitter')
+plt.tight_layout()
+print('Heavy augmentation is deliberate: with 244 images, overfitting is the main enemy.')
+
+#%% md
+## 2. What did ImageNet teach it?
+
+Load the pretrained weights and look at the first convolution. Chapter 3 hand-designed Sobel
+and Gaussian kernels; layer 1 of a network trained on 1.2M photos **learned the same things**,
+plus colour opponents.
+
+#%% code
+weights = models.ResNet18_Weights.IMAGENET1K_V1
+model = models.resnet18(weights=weights)
+print('loaded resnet18 with ImageNet weights')
+print(f'parameters: {sum(p.numel() for p in model.parameters()):,}')
+print('conv1 weight shape:', tuple(model.conv1.weight.shape), '= (64 filters, 3 channels, 7, 7)')
+
+W = model.conv1.weight.detach().clone()
+W = (W - W.min()) / (W.max() - W.min())          # scale to 0..1 for display
+
+fig, axes = plt.subplots(4, 16, figsize=(14, 3.8))
+for ax, i in zip(axes.ravel(), range(64)):
+    ax.imshow(W[i].permute(1, 2, 0).numpy()); ax.axis('off')
+plt.suptitle('all 64 learned 7x7 filters of resnet18 layer 1')
+plt.tight_layout()
+
+print('\nYou can read them: oriented edge detectors at many angles (Sobel, learned), blobs')
+print('(Gaussians, learned), and colour-opponent patches. Nobody designed these - and nobody')
+print('had to. These are the features you get for free by not starting from scratch.')
+
+#%% code
+print('resnet18 structure (top level):')
+for name, mod in model.named_children():
+    n = sum(p.numel() for p in mod.parameters())
+    print(f'  {name:10} {type(mod).__name__:18} {n:11,d} params')
+
+print('\nthe head is `fc`:', model.fc)
+print('in_features =', model.fc.in_features, '<- read this, never hard-code 512')
+print('\nWhy 512? layer4 outputs 512 channels, then avgpool collapses H,W to 1x1.')
+print('That is the global average pooling from chapter 3, in a real architecture.')
+
+#%% code
+print('the pretrained model already works - on ImageNet classes:\n')
+categories = weights.meta['categories']
+img_pil = datasets.ImageFolder(data_root / 'val', None)[0][0]
+x = eval_tf(img_pil)[None]
+
+model.eval()
+with torch.no_grad():
+    probs = torch.softmax(model(x), 1)[0]
+top = probs.topk(5)
+for p, i in zip(top.values, top.indices):
+    print(f'  {p.item() * 100:5.1f}%  {categories[i]}')
+
+plt.figure(figsize=(3.2, 3.2))
+plt.imshow(img_pil); plt.axis('off'); plt.title(f'actual class: {CLASSES[0]}', fontsize=10)
+print('\nImageNet has "ant" and several bee classes, so it may already be roughly right.')
+print('But it cannot answer OUR question (ant or bee?) because it has 1000 other options.')
+print('So we replace the head.')
+
+#%% md
+## 3. Shared training utilities
+
+#%% code
+criterion = nn.CrossEntropyLoss()
+
+def train_one_epoch(model, loader, optimizer, device, scheduler=None):
+    model.train()
+    tot, corr, seen = 0.0, 0, 0
+    for xb, yb in loader:
+        xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(xb)
+        loss = criterion(logits, yb)
+        loss.backward()
+        optimizer.step()
+        tot += loss.item() * yb.size(0)
+        corr += (logits.argmax(1) == yb).sum().item()
+        seen += yb.size(0)
+    if scheduler is not None:
+        scheduler.step()
+    return tot / seen, corr / seen
+
+@torch.no_grad()
+def evaluate(model, loader, device, return_preds=False):
+    model.eval()
+    tot, corr, seen = 0.0, 0, 0
+    ts, ps, prs = [], [], []
+    for xb, yb in loader:
+        xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+        logits = model(xb)
+        tot += criterion(logits, yb).item() * yb.size(0)
+        pred = logits.argmax(1)
+        corr += (pred == yb).sum().item()
+        seen += yb.size(0)
+        if return_preds:
+            ts.append(yb.cpu()); ps.append(pred.cpu()); prs.append(torch.softmax(logits, 1).cpu())
+    if return_preds:
+        return (tot / seen, corr / seen, torch.cat(ts).numpy(), torch.cat(ps).numpy(), torch.cat(prs).numpy())
+    return tot / seen, corr / seen
+
+def run(model, optimizer, epochs, scheduler=None, label='', quiet=False):
+    hist = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+    best, best_state = 0.0, None
+    for ep in range(epochs):
+        t0 = time.perf_counter()
+        trl, tra = train_one_epoch(model, train_loader, optimizer, device, scheduler)
+        val, vaa = evaluate(model, val_loader, device)
+        for k, v in [('train_loss', trl), ('train_acc', tra), ('val_loss', val), ('val_acc', vaa)]:
+            hist[k].append(v)
+        if vaa > best:
+            best = vaa
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        if not quiet:
+            print(f'  {label:14} ep {ep}: train {tra:.4f} | val {vaa:.4f} | {time.perf_counter() - t0:5.1f}s')
+    return hist, best, best_state
+
+def count_trainable(model):
+    t = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    a = sum(p.numel() for p in model.parameters())
+    return t, a
+
+print('defined train_one_epoch, evaluate, run, count_trainable')
+
+#%% md
+## 4. Strategy A - freeze the backbone (feature extraction)
+
+Freeze every pretrained parameter, replace `fc` with a fresh 2-class layer, train only that.
+The backbone becomes a fixed feature extractor.
+
+#%% code
+EPOCHS = 6
+
+set_seed(0)
+model_frozen = models.resnet18(weights=weights)
+for p in model_frozen.parameters():
+    p.requires_grad = False                                       # freeze everything
+model_frozen.fc = nn.Linear(model_frozen.fc.in_features, len(CLASSES))   # new layer: trainable by default
+model_frozen = model_frozen.to(device)
+
+t, a = count_trainable(model_frozen)
+print(f'trainable {t:,} of {a:,} parameters ({100 * t / a:.2f}%)')
+print('trainable tensors:', [n for n, p in model_frozen.named_parameters() if p.requires_grad])
+
+opt = torch.optim.SGD([p for p in model_frozen.parameters() if p.requires_grad],
+                      lr=0.01, momentum=0.9, weight_decay=1e-4)
+sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
+
+print(f'\ntraining the head only, {EPOCHS} epochs:')
+t0 = time.perf_counter()
+hist_frozen, best_frozen, _ = run(model_frozen, opt, EPOCHS, sch, label='frozen')
+print(f'\nbest val accuracy {best_frozen:.4f} in {time.perf_counter() - t0:.1f}s')
+print('Note we only pass trainable parameters to the optimizer - passing frozen ones works but')
+print('wastes memory on momentum buffers for tensors that never move.')
+
+#%% md
+## 5. Strategy B - fine-tune everything, with discriminative learning rates
+
+Nothing frozen, but the **backbone gets 10x lower LR than the new head**. The head starts random
+and produces large gradients; at a uniform LR those gradients flow back and damage the
+pretrained features in the first few steps.
+
+#%% code
+set_seed(0)
+model_ft = models.resnet18(weights=weights)
+model_ft.fc = nn.Linear(model_ft.fc.in_features, len(CLASSES))
+model_ft = model_ft.to(device)
+
+head_params = list(model_ft.fc.parameters())
+head_ids = {id(p) for p in head_params}
+backbone_params = [p for p in model_ft.parameters() if id(p) not in head_ids]
+
+t, a = count_trainable(model_ft)
+print(f'trainable {t:,} of {a:,} parameters (everything)')
+print(f'backbone tensors {len(backbone_params)} | head tensors {len(head_params)}')
+
+opt = torch.optim.SGD([
+    {'params': backbone_params, 'lr': 1e-3},      # gentle: preserve what ImageNet taught
+    {'params': head_params, 'lr': 1e-2},          # 10x: this layer knows nothing yet
+], momentum=0.9, weight_decay=1e-4)
+sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
+
+print(f'\nfine-tuning all layers, {EPOCHS} epochs:')
+t0 = time.perf_counter()
+hist_ft, best_ft, best_state_ft = run(model_ft, opt, EPOCHS, sch, label='fine-tune')
+print(f'\nbest val accuracy {best_ft:.4f} in {time.perf_counter() - t0:.1f}s')
+
+#%% md
+## 6. Strategy C - from scratch, for comparison
+
+Identical architecture, identical hyperparameters, identical data. Only difference: random
+initialization instead of ImageNet weights.
+
+#%% code
+set_seed(0)
+model_scratch = models.resnet18(weights=None)          # random init
+model_scratch.fc = nn.Linear(model_scratch.fc.in_features, len(CLASSES))
+model_scratch = model_scratch.to(device)
+
+opt = torch.optim.SGD(model_scratch.parameters(), lr=1e-2, momentum=0.9, weight_decay=1e-4)
+sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
+
+print(f'training from scratch, {EPOCHS} epochs:')
+hist_scratch, best_scratch, _ = run(model_scratch, opt, EPOCHS, sch, label='scratch')
+print(f'\nbest val accuracy {best_scratch:.4f}')
+
+#%% code
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.8))
+for h, name, c in [(hist_scratch, 'from scratch', 'C3'), (hist_frozen, 'frozen backbone', 'C0'),
+                   (hist_ft, 'fine-tuned', 'C2')]:
+    axes[0].plot(h['val_acc'], marker='o', color=c, label=name)
+    axes[1].plot(h['val_loss'], marker='o', color=c, label=name)
+axes[0].set_ylabel('val accuracy'); axes[1].set_ylabel('val loss')
+axes[0].axhline(0.5, ls=':', c='k', label='chance (2 classes)')
+for ax in axes:
+    ax.set_xlabel('epoch'); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+plt.suptitle(f'same architecture, same data, same hyperparameters - {EPOCHS} epochs each')
+plt.tight_layout()
+
+print(f'{"strategy":20} {"best val acc":>13} {"trainable params":>18}')
+print(f'{"from scratch":20} {best_scratch:13.4f} {sum(p.numel() for p in model_scratch.parameters()):18,d}')
+print(f'{"frozen backbone":20} {best_frozen:13.4f} {count_trainable(model_frozen)[0]:18,d}')
+print(f'{"fine-tuned":20} {best_ft:13.4f} {count_trainable(model_ft)[0]:18,d}')
+t_frozen, a_frozen = count_trainable(model_frozen)
+print(f'\nThe frozen model trains {t_frozen:,} parameters - {100 * t_frozen / a_frozen:.3f}% of the network -')
+print(f'and still beats the from-scratch model by {best_frozen - best_scratch:+.3f}.')
+print('With 244 images there is simply not enough signal to learn good features from nothing.')
+
+#%% md
+## 7. Catastrophic forgetting: the wrong learning rate, live
+
+Fine-tune with a **uniform, high** learning rate and watch the pretrained features get
+destroyed. Validation accuracy starts high (the features are still good) and then falls.
+
+#%% code
+set_seed(0)
+model_bad = models.resnet18(weights=weights)
+model_bad.fc = nn.Linear(model_bad.fc.in_features, len(CLASSES))
+model_bad = model_bad.to(device)
+
+opt_bad = torch.optim.SGD(model_bad.parameters(), lr=0.2, momentum=0.9)   # far too high
+print('fine-tuning everything at a uniform lr=0.2:')
+hist_bad, best_bad, _ = run(model_bad, opt_bad, EPOCHS, None, label='lr=0.2')
+
+plt.figure(figsize=(6, 3.6))
+plt.plot(hist_ft['val_acc'], marker='o', label='backbone 1e-3 / head 1e-2 (good)')
+plt.plot(hist_bad['val_acc'], marker='s', label='uniform 0.2 (destroys features)')
+plt.axhline(0.5, ls=':', c='k', label='chance')
+plt.xlabel('epoch'); plt.ylabel('val accuracy'); plt.legend(fontsize=8); plt.grid(alpha=0.3)
+plt.title('catastrophic forgetting')
+
+print(f'\ngood schedule: best {best_ft:.4f}')
+print(f'lr too high  : best {best_bad:.4f}  ({best_bad - best_ft:+.4f})')
+
+peak_ep = int(np.argmax(hist_bad['val_acc']))
+final_ep = len(hist_bad['val_acc']) - 1
+print()
+if hist_bad['val_acc'][final_ep] < hist_bad['val_acc'][peak_ep] - 0.02:
+    print(f'Textbook forgetting: peaked at epoch {peak_ep} ({hist_bad["val_acc"][peak_ep]:.3f}) and')
+    print(f'ended at {hist_bad["val_acc"][final_ep]:.3f}. Accuracy going DOWN over epochs is the')
+    print('signature - the pretrained weights are being overwritten by noisy gradients.')
+else:
+    print('This run survived lr=0.2 (SGD is noisy; re-run and you will often see it collapse).')
+    print(f'Either way it is clearly worse than the tuned schedule, and the curve is erratic.')
+print('\nThe signature to watch for: val accuracy decent early, then FALLING. That is not')
+print('underfitting - it is catastrophic forgetting. Fix: lower the backbone LR, or freeze')
+print('first and warm up the head before unfreezing.')
+
+#%% md
+## 8. The safe recipe: freeze, warm up the head, then unfreeze
+
+This two-phase schedule is what I would actually use on an unfamiliar dataset. It gets the
+robustness of freezing and the ceiling of fine-tuning.
+
+#%% code
+set_seed(0)
+model_two = models.resnet18(weights=weights)
+for p in model_two.parameters():
+    p.requires_grad = False
+model_two.fc = nn.Linear(model_two.fc.in_features, len(CLASSES))
+model_two = model_two.to(device)
+
+print('phase 1: backbone frozen, warm up the head (2 epochs)')
+opt1 = torch.optim.SGD([p for p in model_two.parameters() if p.requires_grad], lr=0.01, momentum=0.9)
+h1, b1, _ = run(model_two, opt1, 2, None, label='phase1')
+
+print('\nphase 2: unfreeze everything, low LR (4 epochs)')
+for p in model_two.parameters():
+    p.requires_grad = True
+head_ids = {id(p) for p in model_two.fc.parameters()}
+opt2 = torch.optim.SGD([
+    {'params': [p for p in model_two.parameters() if id(p) not in head_ids], 'lr': 5e-4},
+    {'params': list(model_two.fc.parameters()), 'lr': 5e-3},
+], momentum=0.9, weight_decay=1e-4)
+sch2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=4)
+h2, b2, best_state_two = run(model_two, opt2, 4, sch2, label='phase2')
+
+best_two = max(b1, b2)
+print(f'\nbest overall {best_two:.4f}')
+print(f'  (frozen only {best_frozen:.4f} | one-phase fine-tune {best_ft:.4f})')
+
+plt.figure(figsize=(6, 3.6))
+combined = h1['val_acc'] + h2['val_acc']
+plt.plot(combined, marker='o', label='freeze -> unfreeze')
+plt.plot(hist_ft['val_acc'], marker='s', alpha=0.6, label='one-phase fine-tune')
+plt.axvline(1.5, ls='--', c='k', alpha=0.5)
+plt.text(1.6, min(combined) + 0.01, 'unfreeze', fontsize=8)
+plt.xlabel('epoch'); plt.ylabel('val accuracy'); plt.legend(fontsize=8); plt.grid(alpha=0.3)
+plt.title('two-phase schedule')
+
+#%% md
+## 9. The BatchNorm subtlety when freezing
+
+`requires_grad = False` stops **gradients**, but BatchNorm's `running_mean` / `running_var` are
+**buffers**, not parameters - they keep updating in `train()` mode regardless. On a small dataset
+that silently drifts your "frozen" features.
+
+#%% code
+probe = models.resnet18(weights=weights).to(device)
+for p in probe.parameters():
+    p.requires_grad = False
+
+bn = probe.layer1[0].bn1
+before = bn.running_mean.detach().clone()
+
+probe.train()                                    # train mode
+with torch.no_grad():
+    for _ in range(3):
+        probe(xb.to(device))                     # forward passes only, no backward at all
+after_train_mode = bn.running_mean.detach().clone()
+
+probe.eval()                                     # eval mode
+with torch.no_grad():
+    for _ in range(3):
+        probe(xb.to(device))
+after_eval_mode = bn.running_mean.detach().clone()
+
+print('all parameters frozen (requires_grad=False everywhere)\n')
+print(f'running_mean change after 3 forwards in train() mode: {(after_train_mode - before).abs().max():.6f}')
+print(f'running_mean change after 3 forwards in eval()  mode: {(after_eval_mode - after_train_mode).abs().max():.6f}')
+print('\n-> train() mode moved the "frozen" statistics. eval() mode did not.')
+
+def freeze_bn(module):
+    """Put every BatchNorm in eval mode so its running stats stop updating."""
+    for m in module.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.eval()
+
+probe.train(); freeze_bn(probe)
+mark = bn.running_mean.detach().clone()
+with torch.no_grad():
+    for _ in range(3):
+        probe(xb.to(device))
+print(f'\nafter train() + freeze_bn(): change = {(bn.running_mean - mark).abs().max():.6f}  <- truly frozen')
+print('\nCaveat: model.train() RESETS this, so call freeze_bn() again after every model.train().')
+print('This is a real bug people hit: "my frozen backbone gives different results each epoch".')
+
+#%% md
+## 10. Grad-CAM: is it right for the right reason?
+
+Which spatial locations drove the prediction? Weight the last conv layer's feature maps by their
+average gradient with respect to the class score, sum, and ReLU.
+
+Implemented with **hooks**, which are the general tool for reading or modifying any intermediate
+value in a PyTorch model.
+
+#%% code
+class GradCAM:
+    """Grad-CAM for a single target layer, via forward and backward hooks."""
+
+    def __init__(self, model, target_layer):
+        self.model = model.eval()
+        self.acts = None
+        self.grads = None
+        self.handles = [
+            target_layer.register_forward_hook(self._save_acts),
+            target_layer.register_full_backward_hook(self._save_grads),
+        ]
+
+    def _save_acts(self, module, inp, out):
+        self.acts = out.detach()                       # (1, C, h, w) feature maps
+
+    def _save_grads(self, module, grad_in, grad_out):
+        self.grads = grad_out[0].detach()              # d(score) / d(feature maps)
+
+    def __call__(self, x, class_idx=None):
+        self.model.zero_grad(set_to_none=True)
+        logits = self.model(x)
+        if class_idx is None:
+            class_idx = int(logits.argmax(1))
+        logits[0, class_idx].backward()                # backprop from ONE class score
+
+        alpha = self.grads.mean(dim=(2, 3), keepdim=True)      # (1, C, 1, 1) channel importance
+        cam = F.relu((alpha * self.acts).sum(dim=1, keepdim=True))
+        cam = F.interpolate(cam, size=x.shape[-2:], mode='bilinear', align_corners=False)
+        cam = cam[0, 0]
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+        return cam.cpu().numpy(), class_idx, torch.softmax(logits, 1)[0, class_idx].item()
+
+    def close(self):
+        for h in self.handles:
+            h.remove()
+
+
+model_ft.load_state_dict(best_state_ft)
+cam_engine = GradCAM(model_ft, model_ft.layer4[-1])       # last conv block: 7x7 spatial resolution
+
+val_plain = datasets.ImageFolder(data_root / 'val', None)
+picks = [0, 20, 40, 80, 100, 130]
+
+fig, axes = plt.subplots(2, len(picks), figsize=(2.2 * len(picks), 5))
+for col, i in enumerate(picks):
+    pil, true_y = val_plain[i]
+    x = eval_tf(pil)[None].to(device)
+    cam, pred, conf = cam_engine(x)
+    disp = denormalize(x[0])
+    axes[0, col].imshow(disp)
+    axes[0, col].set_title(f'true {CLASSES[true_y]}', fontsize=8)
+    axes[1, col].imshow(disp)
+    axes[1, col].imshow(cam, cmap='jet', alpha=0.45)
+    ok = 'OK' if pred == true_y else 'WRONG'
+    axes[1, col].set_title(f'pred {CLASSES[pred]} {conf:.2f} {ok}', fontsize=8)
+for ax in axes.ravel():
+    ax.axis('off')
+plt.suptitle('Grad-CAM: red = the evidence the model used')
+plt.tight_layout()
+cam_engine.close()
+
+print('Look for the heat sitting on the INSECT, not on a flower or a leaf. If the model is')
+print('confident and the heatmap is on the background, it has learned a shortcut - the flower')
+print('predicts "bee" because bees are photographed on flowers. No loss curve shows you that.')
+
+#%% md
+## 11. Final evaluation
+
+#%% code
+_, acc, y_true, y_pred, y_prob = evaluate(model_ft, val_loader, device, return_preds=True)
+
+def confusion_matrix(y_true, y_pred, k):
+    return np.bincount(y_true.astype(np.int64) * k + y_pred.astype(np.int64), minlength=k * k).reshape(k, k)
+
+cm = confusion_matrix(y_true, y_pred, len(CLASSES))
+print(f'fine-tuned model: val accuracy {acc:.4f} on {len(y_true)} images\n')
+print('confusion matrix (rows actual, cols predicted)')
+print(f'{"":8}' + ''.join(f'{c:>8}' for c in CLASSES))
+for i, c in enumerate(CLASSES):
+    print(f'{c:8}' + ''.join(f'{v:8d}' for v in cm[i]))
+for i, c in enumerate(CLASSES):
+    print(f'\n{c}: recall {cm[i, i] / cm[i].sum():.3f}, precision {cm[i, i] / max(cm[:, i].sum(), 1):.3f}')
+
+wrong = np.where(y_pred != y_true)[0]
+print(f'\n{len(wrong)} mistakes')
+if len(wrong):
+    order = wrong[np.argsort(-y_prob[wrong].max(1))]
+    n = min(6, len(order))
+    fig, axes = plt.subplots(1, n, figsize=(2.2 * n, 2.6))
+    axes = np.atleast_1d(axes)
+    for ax, idx in zip(axes, order[:n]):
+        ax.imshow(val_plain[int(idx)][0])
+        ax.set_title(f'true {CLASSES[y_true[idx]]}\npred {CLASSES[y_pred[idx]]} {y_prob[idx].max():.2f}', fontsize=8)
+        ax.axis('off')
+    plt.suptitle('most confident mistakes')
+    plt.tight_layout()
+
+#%% md
+## What to remember
+
+| Idea | The one-liner |
+|---|---|
+| Why it works | early layers learn universal edges/textures; only the head is task-specific |
+| Normalization | use **ImageNet** stats, or `weights.transforms()`. Mismatched preprocessing is the #1 bug |
+| Freeze | `p.requires_grad = False`, then replace the head (new layers are trainable by default) |
+| Find the head | `model.fc` / `model.classifier[-1]` / `model.heads.head`; read `in_features` |
+| Discriminative LR | backbone 10x lower than the new head |
+| Catastrophic forgetting | val accuracy peaks early then falls -> backbone LR too high |
+| Safe recipe | freeze -> warm up head 2-3 epochs -> unfreeze at low LR + cosine |
+| Freezing BatchNorm | `requires_grad=False` does *not* stop running stats; also call `.eval()` on the BN layers |
+| Small dataset | freeze more, augment more, lower the LR |
+| Grad-CAM | gradient-weighted sum of the last conv feature maps; catches background shortcuts |
+| Optimizer | pass only trainable parameters to save optimizer state |
+
+Now do [`exercises/ex05_transfer.ipynb`](../exercises/ex05_transfer.ipynb), then
+[chapter 6](../docs/06_segmentation.md), where we stop asking *what* is in the image and start
+asking *where*.

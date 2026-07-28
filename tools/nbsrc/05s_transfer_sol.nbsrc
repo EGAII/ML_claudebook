@@ -1,0 +1,529 @@
+#out exercises/solutions/sol05_transfer.ipynb
+#gpu on
+
+#%% md
+# Solutions 5 - Transfer learning (MobileNetV3)
+
+Answers to [`ex05_transfer.ipynb`](../ex05_transfer.ipynb), with reasoning.
+
+> **GPU: Runtime -> Change runtime type -> T4 GPU.**
+
+#%% code
+import time, urllib.request, zipfile
+from pathlib import Path
+
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+import torchvision
+from torchvision import datasets, transforms, models
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print('torch', torch.__version__, '| device', device)
+
+try:
+    import google.colab  # noqa: F401
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+ROOT = Path('/content' if IN_COLAB else '.')
+NUM_WORKERS = 2 if IN_COLAB else 0
+
+def set_seed(seed=0):
+    import random
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+set_seed(0)
+torch.backends.cudnn.benchmark = True
+plt.rcParams['figure.dpi'] = 110
+
+data_root = ROOT / 'hymenoptera_data'
+if not data_root.exists():
+    urllib.request.urlretrieve('https://download.pytorch.org/tutorial/hymenoptera_data.zip',
+                               ROOT / 'hymenoptera_data.zip')
+    with zipfile.ZipFile(ROOT / 'hymenoptera_data.zip') as z:
+        z.extractall(ROOT)
+
+WEIGHTS = models.MobileNet_V3_Small_Weights.IMAGENET1K_V1
+print('data at', data_root)
+
+#%% md
+---
+## Task 1 - Preprocessing from the weights
+
+#%% code
+eval_tf = WEIGHTS.transforms()
+MEAN, STD = eval_tf.mean, eval_tf.std
+
+train_tf = transforms.Compose([
+    transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),
+    transforms.RandomHorizontalFlip(),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.ToTensor(),
+    transforms.Normalize(MEAN, STD),
+])
+
+train_ds = datasets.ImageFolder(data_root / 'train', train_tf)
+val_ds = datasets.ImageFolder(data_root / 'val', eval_tf)
+CLASSES = train_ds.classes
+train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=NUM_WORKERS,
+                          pin_memory=device.type == 'cuda')
+val_loader = DataLoader(val_ds, batch_size=64, shuffle=False, num_workers=NUM_WORKERS,
+                        pin_memory=device.type == 'cuda')
+
+print('eval_tf:', eval_tf)
+print('\nmean', MEAN, '| std', STD, '| crop', eval_tf.crop_size, '| resize', eval_tf.resize_size)
+assert list(MEAN) == [0.485, 0.456, 0.406] and list(STD) == [0.229, 0.224, 0.225]
+print(f'PASS  {CLASSES} | train {len(train_ds)} | val {len(val_ds)}')
+
+def denormalize(t):
+    m = torch.tensor(MEAN).view(-1, 1, 1); s = torch.tensor(STD).view(-1, 1, 1)
+    return (t.detach().cpu() * s + m).clamp(0, 1).permute(1, 2, 0).numpy()
+
+xb, yb = next(iter(train_loader))
+fig, axes = plt.subplots(1, 8, figsize=(13, 2))
+for ax, i in zip(axes, range(8)):
+    ax.imshow(denormalize(xb[i])); ax.set_title(CLASSES[yb[i]], fontsize=8); ax.axis('off')
+plt.tight_layout()
+
+#%% md
+### Why get the transform from the weights
+
+`WEIGHTS.transforms()` returns the **exact** preprocessing these weights were validated with -
+resize 256, centre-crop 224, ImageNet mean/std - and it carries them as inspectable attributes
+(`.mean`, `.std`, `.crop_size`, `.resize_size`).
+
+Why this matters more than it looks:
+
+- **It eliminates a whole bug class.** Mismatched normalization is the number one transfer
+  learning bug: the model runs, the loss decreases, accuracy is just mysteriously mediocre.
+  Nothing errors, because a tensor of the wrong scale is still a valid tensor.
+- **It survives a model swap.** Change to `EfficientNet_B0_Weights` and the preprocessing follows
+  automatically - some models want 224, others 232 or 288, and some use different statistics.
+  Hard-coded constants silently become wrong.
+- **It documents itself.** `print(eval_tf)` tells the next reader exactly what the model expects.
+
+**Use ImageNet statistics, not your dataset's.** This surprises people who learned "always
+normalize with your own training statistics" - correct when you train from scratch, wrong here.
+The pretrained weights encode an expectation about the input distribution; matching that
+expectation beats being locally optimal for your 244 images.
+
+**Augmentation stays hand-written**, because `weights.transforms()` deliberately gives you the
+*deterministic evaluation* pipeline. Just make sure your training pipeline ends with the same
+`Normalize`.
+
+#%% md
+---
+## Task 2 - Find and replace the head
+
+#%% code
+probe = models.mobilenet_v3_small(weights=WEIGHTS)
+print('classifier:', probe.classifier)
+
+def replace_head(model, n_classes):
+    in_features = model.classifier[-1].in_features        # READ it, never hard-code
+    model.classifier[-1] = nn.Linear(in_features, n_classes)
+    return model
+
+
+m = replace_head(models.mobilenet_v3_small(weights=WEIGHTS), 2)
+ref = models.mobilenet_v3_small(weights=WEIGHTS)
+assert m(torch.randn(2, 3, 224, 224)).shape == (2, 2)
+assert m.classifier[-1].in_features == ref.classifier[-1].in_features
+assert torch.equal(m.features[0][0].weight, ref.features[0][0].weight)
+print(f'PASS  new head Linear({m.classifier[-1].in_features}, 2)')
+
+#%% md
+### Why `classifier[-1]` and not `fc`
+
+Every family names its head differently:
+
+| Model | Head |
+|---|---|
+| ResNet, ShuffleNet | `model.fc` |
+| MobileNetV3, EfficientNet | `model.classifier[-1]` |
+| VGG, AlexNet | `model.classifier[6]` |
+| DenseNet | `model.classifier` (a bare Linear) |
+| ViT | `model.heads.head` |
+| ConvNeXt | `model.classifier[2]` |
+
+`print(model)` or `list(model.named_children())` finds it in seconds. There is no universal
+attribute, which is exactly why you should look rather than guess.
+
+**Why `classifier[-1]` beats `classifier[3]`.** Indexing from the end still works if the
+architecture gains or loses a dropout layer between versions. Positional indexing from the front
+is a time bomb.
+
+**`in_features` must be read, not typed.** For `mobilenet_v3_small` it's 1024; for
+`mobilenet_v3_large` it's 1280; for `resnet18` 512; `resnet50` 2048. Hard-code it and swapping
+backbones gives you a shape error at best, and at worst a silently mis-sized layer.
+
+**Assigning to `model.classifier[-1]` works** because `nn.Sequential` supports item assignment and
+re-registers the new module. The old layer (and its 1000-class weights) is simply dropped.
+
+**Note MobileNetV3 keeps a `Linear(576, 1024) + Hardswish + Dropout` in front of the final layer.**
+We're only replacing the last one, so we inherit that extra learned projection - which is part of
+why the frozen version does so well with only ~2k trainable parameters.
+
+#%% md
+---
+## Task 3 - Freeze the backbone
+
+#%% code
+def make_frozen(n_classes=2):
+    model = models.mobilenet_v3_small(weights=WEIGHTS)
+    for p in model.parameters():
+        p.requires_grad = False                      # freeze FIRST...
+    return replace_head(model, n_classes)            # ...then add the head (trainable by default)
+
+
+fm = make_frozen(2)
+trainable = [n for n, p in fm.named_parameters() if p.requires_grad]
+n_train = sum(p.numel() for p in fm.parameters() if p.requires_grad)
+n_all = sum(p.numel() for p in fm.parameters())
+assert 0 < n_train < 5000 and all('classifier' in n for n in trainable)
+print(f'PASS  trainable {n_train:,} of {n_all:,} ({100 * n_train / n_all:.3f}%)')
+print('      ', trainable)
+
+#%% md
+### Why the order matters
+
+Freeze, **then** replace. A freshly constructed `nn.Linear` has `requires_grad=True`, so adding it
+after the freeze loop leaves it trainable. Reverse the order and the loop freezes your new head
+too - and then nothing trains at all. The symptom is a loss that sits perfectly flat, which is at
+least an obvious symptom.
+
+**A subtlety about "frozen".** `requires_grad=False` stops gradients, but **not** BatchNorm's
+running statistics - those are buffers updated by the forward pass in `train()` mode. On a
+244-image dataset those statistics can drift meaningfully away from ImageNet's. For a truly frozen
+backbone:
+
+```python
+def freeze_bn(module):
+    for m in module.modules():
+        if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
+            m.eval()
+
+model.train(); freeze_bn(model.features)     # re-apply after EVERY model.train()
+```
+
+MobileNetV3 is full of BatchNorm, so this applies here. It usually costs less than a percent, but
+it's the explanation when a frozen backbone gives different results epoch to epoch.
+
+**Why pass only trainable params to the optimizer.** `SGD(model.parameters())` also works - frozen
+tensors have `p.grad is None` and get skipped - but the optimizer allocates momentum buffers for
+every parameter it's given. Passing 2k parameters instead of 2.5M means a 2.5M-float momentum
+buffer you never use. With Adam (two buffers) on a large model that's real memory.
+
+#%% md
+---
+## Task 4 - Train the frozen model
+
+#%% code
+criterion = nn.CrossEntropyLoss()
+
+def train_one_epoch(model, loader, optimizer, device, scheduler=None):
+    model.train()
+    tot, corr, seen = 0.0, 0, 0
+    for xb, yb in loader:
+        xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(xb)
+        loss = criterion(logits, yb)
+        loss.backward()
+        optimizer.step()
+        tot += loss.item() * yb.size(0)
+        corr += (logits.argmax(1) == yb).sum().item()
+        seen += yb.size(0)
+    if scheduler is not None:
+        scheduler.step()
+    return tot / seen, corr / seen
+
+
+@torch.no_grad()
+def evaluate(model, loader, device, return_preds=False):
+    model.eval()
+    tot, corr, seen = 0.0, 0, 0
+    ts, ps, prs = [], [], []
+    for xb, yb in loader:
+        xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+        logits = model(xb)
+        tot += criterion(logits, yb).item() * yb.size(0)
+        pred = logits.argmax(1)
+        corr += (pred == yb).sum().item()
+        seen += yb.size(0)
+        if return_preds:
+            ts.append(yb.cpu()); ps.append(pred.cpu()); prs.append(torch.softmax(logits, 1).cpu())
+    if return_preds:
+        return (tot / seen, corr / seen, torch.cat(ts).numpy(), torch.cat(ps).numpy(), torch.cat(prs).numpy())
+    return tot / seen, corr / seen
+
+
+def run(model, optimizer, epochs, scheduler=None, label=''):
+    hist = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+    best, best_state = 0.0, None
+    for ep in range(epochs):
+        t0 = time.perf_counter()
+        trl, tra = train_one_epoch(model, train_loader, optimizer, device, scheduler)
+        val, vaa = evaluate(model, val_loader, device)
+        for k, v in [('train_loss', trl), ('train_acc', tra), ('val_loss', val), ('val_acc', vaa)]:
+            hist[k].append(v)
+        if vaa > best:
+            best = vaa
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        print(f'  {label:12} ep {ep}: train {tra:.4f} | val {vaa:.4f} | {time.perf_counter() - t0:5.1f}s')
+    return hist, best, best_state
+
+
+EPOCHS = 5
+set_seed(0)
+model_frozen = make_frozen(2).to(device)
+opt = torch.optim.SGD([p for p in model_frozen.parameters() if p.requires_grad],
+                      lr=0.02, momentum=0.9, weight_decay=1e-4)
+sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
+hist_frozen, best_frozen, _ = run(model_frozen, opt, EPOCHS, sch, label='frozen')
+assert best_frozen > 0.90
+print(f'PASS  best val accuracy {best_frozen:.4f}')
+
+#%% md
+---
+## Task 5 - Discriminative learning rates
+
+#%% code
+def make_finetune_optimizer(model, backbone_lr, head_lr, momentum=0.9, weight_decay=1e-4):
+    head_params = list(model.classifier[-1].parameters())
+    head_ids = {id(p) for p in head_params}
+    backbone_params = [p for p in model.parameters() if id(p) not in head_ids]
+    return torch.optim.SGD([
+        {'params': backbone_params, 'lr': backbone_lr},
+        {'params': head_params, 'lr': head_lr},
+    ], momentum=momentum, weight_decay=weight_decay)
+
+
+set_seed(0)
+model_ft = replace_head(models.mobilenet_v3_small(weights=WEIGHTS), 2).to(device)
+opt_ft = make_finetune_optimizer(model_ft, 1e-3, 1e-2)
+assert len(opt_ft.param_groups) == 2
+n_g0 = sum(p.numel() for p in opt_ft.param_groups[0]['params'])
+n_g1 = sum(p.numel() for p in opt_ft.param_groups[1]['params'])
+assert n_g0 + n_g1 == sum(p.numel() for p in model_ft.parameters())
+print(f'backbone group {n_g0:,} params @ 1e-3 | head group {n_g1:,} params @ 1e-2')
+
+sch_ft = torch.optim.lr_scheduler.CosineAnnealingLR(opt_ft, T_max=EPOCHS)
+hist_ft, best_ft, best_state_ft = run(model_ft, opt_ft, EPOCHS, sch_ft, label='fine-tune')
+print(f'PASS  fine-tuned {best_ft:.4f} | frozen {best_frozen:.4f}')
+
+plt.figure(figsize=(6, 3.6))
+plt.plot(hist_frozen['val_acc'], marker='o', label=f'frozen ({best_frozen:.3f})')
+plt.plot(hist_ft['val_acc'], marker='s', label=f'fine-tuned ({best_ft:.3f})')
+plt.axhline(0.5, ls=':', c='k', label='chance')
+plt.xlabel('epoch'); plt.ylabel('val accuracy'); plt.legend(fontsize=8); plt.grid(alpha=0.3)
+
+#%% md
+### Why identity-based grouping
+
+```python
+head_ids = {id(p) for p in head_params}
+backbone_params = [p for p in model.parameters() if id(p) not in head_ids]
+```
+
+Comparing by `id()` rather than by name or by value:
+
+- **By value is wrong** - `p in head_params` invokes `__eq__` on tensors, which returns an
+  elementwise boolean tensor, and Python then raises "Boolean value of Tensor with more than one
+  element is ambiguous". A classic.
+- **By name is brittle** - `'classifier' in name` also catches `classifier.0`, the 576->1024
+  projection, which you may or may not want in the head group. Explicit is better.
+- **Every parameter must land in exactly one group.** The assertion `n_g0 + n_g1 == total` checks
+  this. A parameter in *no* group silently never trains; in *two* groups it gets updated twice per
+  step (effectively double the learning rate) - and neither failure raises.
+
+**Why the head needs a bigger LR.** It's randomly initialized while the backbone is already good.
+At a uniform LR you either move the head too slowly (wasting epochs) or the backbone too fast
+(destroying features). The 10x ratio is a solid default; 3x-100x all appear in practice.
+
+**Where the loss gradient actually goes in the first steps.** The random head produces large,
+essentially meaningless gradients that flow *back into* the backbone. That's the mechanism of
+catastrophic forgetting, and it's why "freeze, warm up the head, then unfreeze" is such a robust
+recipe - by the time the backbone is unfrozen, the head's gradients are informative.
+
+**Note on `weight_decay` in the group dicts.** Here it's a shared default across both groups. You
+can also set it per group - and a common refinement is `weight_decay=0` for BatchNorm parameters
+and biases, as in chapter 4.
+
+#%% md
+---
+## Task 6 - From scratch, for contrast
+
+#%% code
+set_seed(0)
+model_scratch = models.mobilenet_v3_small(weights=None)
+model_scratch = replace_head(model_scratch, 2).to(device)
+opt_sc = torch.optim.SGD(model_scratch.parameters(), lr=1e-2, momentum=0.9, weight_decay=1e-4)
+sch_sc = torch.optim.lr_scheduler.CosineAnnealingLR(opt_sc, T_max=EPOCHS)
+hist_scratch, best_scratch, _ = run(model_scratch, opt_sc, EPOCHS, sch_sc, label='scratch')
+
+print(f'\n{"strategy":18} {"best val acc":>13}')
+print(f'{"from scratch":18} {best_scratch:13.4f}')
+print(f'{"frozen backbone":18} {best_frozen:13.4f}')
+print(f'{"fine-tuned":18} {best_ft:13.4f}')
+assert best_frozen > best_scratch + 0.05
+print(f'\nPASS  pretraining is worth {best_frozen - best_scratch:+.3f} here')
+
+plt.figure(figsize=(6, 3.6))
+for h, name in [(hist_scratch, 'scratch'), (hist_frozen, 'frozen'), (hist_ft, 'fine-tuned')]:
+    plt.plot(h['val_acc'], marker='o', label=name)
+plt.axhline(0.5, ls=':', c='k', label='chance')
+plt.xlabel('epoch'); plt.ylabel('val accuracy'); plt.legend(fontsize=8); plt.grid(alpha=0.3)
+
+#%% md
+### Why more epochs cannot fix the from-scratch model
+
+Because the bottleneck is **information, not optimization**.
+
+MobileNetV3-Small has ~2.5M parameters. The training set is 244 images. Even with heavy
+augmentation there is not enough signal in 244 examples to *discover* good general-purpose edge,
+texture and part detectors - the pretrained backbone learned those from 1.2 million images. More
+epochs on the same 244 images doesn't add information; it just lets the model memorise them
+better. You would watch training accuracy climb toward 1.0 while validation accuracy plateaus or
+falls - textbook overfitting, and exactly what the curves show.
+
+What *would* actually help, in order:
+
+1. **More data** - the only real fix for an information shortage. 10k+ images and from-scratch
+   becomes viable.
+2. **Transfer learning** - which is "borrow someone else's data" and the entire point of this
+   chapter.
+3. **Self-supervised pretraining** on unlabelled images from your domain, if you have lots of
+   unlabelled data but few labels.
+4. **A much smaller model** - fewer parameters, less to overfit. It raises the from-scratch floor
+   but won't reach the pretrained ceiling.
+5. **Stronger regularization** (more augmentation, more weight decay) - buys a little, doesn't
+   change the picture.
+
+The general principle worth carrying forward: **when a model underperforms, ask whether you're
+limited by optimization, by capacity, or by information.** Each has a different fix, and reaching
+for the wrong one wastes days. "Overfit one batch" from chapter 4 tests optimization; a
+train/validation gap tests information.
+
+#%% md
+---
+## Task 7 - Grad-CAM
+
+#%% code
+class GradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model.eval()
+        self.acts = None
+        self.grads = None
+        self.handles = [
+            target_layer.register_forward_hook(self._fwd),
+            target_layer.register_full_backward_hook(self._bwd),
+        ]
+
+    def _fwd(self, module, inp, out):
+        self.acts = out.detach()
+
+    def _bwd(self, module, grad_in, grad_out):
+        self.grads = grad_out[0].detach()
+
+    def __call__(self, x, class_idx=None):
+        self.model.zero_grad(set_to_none=True)
+        logits = self.model(x)
+        if class_idx is None:
+            class_idx = int(logits.argmax(1))
+        logits[0, class_idx].backward()
+
+        alpha = self.grads.mean(dim=(2, 3), keepdim=True)          # (1, C, 1, 1)
+        cam = F.relu((alpha * self.acts).sum(dim=1, keepdim=True))  # (1, 1, h, w)
+        cam = F.interpolate(cam, size=x.shape[-2:], mode='bilinear', align_corners=False)[0, 0]
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+        return cam.detach().cpu().numpy(), class_idx, torch.softmax(logits, 1)[0, class_idx].item()
+
+    def close(self):
+        for h in self.handles:
+            h.remove()
+
+
+model_ft.load_state_dict(best_state_ft)
+cam_engine = GradCAM(model_ft.to(device), model_ft.features[-1])
+val_plain = datasets.ImageFolder(data_root / 'val', None)
+
+cam, pred, conf = cam_engine(eval_tf(val_plain[0][0])[None].to(device))
+assert cam.shape == (224, 224) and abs(cam.max() - 1.0) < 1e-5
+print(f'PASS  cam {cam.shape} | pred {CLASSES[pred]} conf {conf:.3f}')
+
+picks = [3, 25, 45, 85, 110, 140]
+fig, axes = plt.subplots(2, len(picks), figsize=(2.2 * len(picks), 5))
+for col, i in enumerate(picks):
+    pil, true_y = val_plain[i]
+    x = eval_tf(pil)[None].to(device)
+    cam, pred, conf = cam_engine(x)
+    disp = denormalize(x[0])
+    axes[0, col].imshow(disp); axes[0, col].set_title(f'true {CLASSES[true_y]}', fontsize=8)
+    axes[1, col].imshow(disp); axes[1, col].imshow(cam, cmap='jet', alpha=0.45)
+    axes[1, col].set_title(f'{CLASSES[pred]} {conf:.2f} {"OK" if pred == true_y else "WRONG"}', fontsize=8)
+for ax in axes.ravel():
+    ax.axis('off')
+plt.suptitle('Grad-CAM on the fine-tuned MobileNetV3')
+plt.tight_layout()
+cam_engine.close()
+
+#%% md
+### Reading Grad-CAM honestly
+
+**What the maths is doing.** $\alpha_k = \overline{\partial y_c / \partial A^k}$ asks "if feature
+map $k$ were uniformly larger, how much would the class score rise?" - a per-channel importance
+weight. The weighted sum $\sum_k \alpha_k A^k$ then says *where* those important features fired.
+The final ReLU keeps only positive evidence, because negative contributions argue *against* the
+class and would muddy the picture.
+
+**Why hook the last conv layer.** It's the last place with spatial structure - after that, global
+pooling destroys position. The tradeoff is resolution: MobileNetV3's final feature map is 7x7, so
+the heatmap is genuinely 7x7 and the smooth blobs you see are bilinear upsampling, not fine
+detail. Never over-interpret the exact boundary of a Grad-CAM blob.
+
+**Implementation details that bite:**
+
+- `register_full_backward_hook`, not the deprecated `register_backward_hook` (which was subtly
+  wrong for modules with multiple inputs).
+- `grad_out[0]` - hooks receive *tuples* of gradients.
+- `.detach()` on both saves, or you leak the graph across calls.
+- No `torch.no_grad()` anywhere - Grad-CAM *needs* the backward pass. But do call `model.eval()`,
+  or BatchNorm statistics shift under you.
+- `zero_grad()` before each call, since gradients accumulate.
+- `remove()` the handles when done, or the model keeps calling your hooks forever - a real memory
+  leak in long-running services.
+
+**What to actually look for.** Heat on the insect: the model learned the object. Heat on the
+flower or the leaf: it learned a **shortcut** - bees are photographed on flowers, so "flower"
+predicts "bee" without ever looking at a bee. That model will collapse on a bee photographed on a
+wall, and *no loss curve will ever tell you*. This is the single best reason to run Grad-CAM on a
+new model.
+
+**And a caveat about caveats.** Saliency methods are known to be partly unfaithful - some produce
+plausible maps for randomly initialized networks. Treat Grad-CAM as a **hypothesis generator**,
+not proof. If it suggests a background shortcut, confirm it properly: occlude the background and
+see whether the prediction survives.
+
+#%% md
+---
+## The chapter in one line
+
+**Don't start from scratch.** Someone spent thousands of GPU-hours learning edges, textures and
+object parts on 1.2 million images; that work is a free download and it is better than anything
+your 244 images can teach.
+
+Order of operations for a new dataset:
+
+1. Pick a pretrained backbone. `resnet18` is a fine default; MobileNetV3 if you need it small.
+2. Get preprocessing from `weights.transforms()`.
+3. Replace the head. Freeze the backbone. Train 2-3 epochs.
+4. Unfreeze, backbone LR ~10x lower than the head, cosine schedule.
+5. Grad-CAM a handful of predictions to check *why* it's right.
+
+Next: [Chapter 6 - Semantic segmentation](../../docs/06_segmentation.md)

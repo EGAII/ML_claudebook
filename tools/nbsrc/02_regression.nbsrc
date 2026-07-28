@@ -1,0 +1,857 @@
+#out notebooks/02_linear_logistic_regression.ipynb
+#gpu off
+
+#%% md
+# Chapter 2 - Regression, gradient descent, and autograd
+
+Companion to [`docs/02_ml_foundations.md`](../docs/02_ml_foundations.md). **Runs fine on CPU** -
+everything here is tiny. Chapters 4-6 are where you need Colab's GPU.
+
+The plan: build linear regression three times.
+
+1. **By hand in NumPy** - so you know what a gradient is.
+2. **With `torch.autograd`** - so you know what `.backward()` replaced.
+3. **With `nn.Module` + optimizer** - the form you'll use forever after.
+
+Then the same trip for logistic regression, and we finish by proving that a linear model
+cannot see geometry - which is the reason chapter 3 exists.
+
+#%% code
+import sys, math, time
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+
+print('python ', sys.version.split()[0])
+print('numpy  ', np.__version__)
+print('torch  ', torch.__version__)
+print('cuda   ', torch.cuda.is_available(), '(not needed for this chapter)')
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print('device ', device)
+
+plt.rcParams['figure.dpi'] = 110
+rng = np.random.default_rng(0)
+torch.manual_seed(0)
+
+#%% md
+## Part 1 - Linear regression by hand
+
+### 1.1 Data with a known answer
+
+Always debug a new optimizer on data whose true parameters you chose yourself. If it can't
+recover `w=2.5, b=-1.0`, the problem is your code, not your data.
+
+#%% code
+TRUE_W, TRUE_B, NOISE = 2.5, -1.0, 1.2
+N = 120
+
+x = rng.uniform(-3, 3, size=N).astype(np.float32)
+y = TRUE_W * x + TRUE_B + rng.normal(0, NOISE, size=N).astype(np.float32)
+
+X = x[:, None]          # (N, 1) design matrix - models want 2D input
+print('X', X.shape, '| y', y.shape)
+
+plt.figure(figsize=(5, 3.4))
+plt.scatter(x, y, s=14, alpha=0.7, label='data')
+xs = np.linspace(-3, 3, 100)
+plt.plot(xs, TRUE_W * xs + TRUE_B, 'r--', label=f'truth: {TRUE_W}x {TRUE_B:+}')
+plt.xlabel('x'); plt.ylabel('y'); plt.legend(); plt.grid(alpha=0.3)
+plt.title('the data, and the line we hope to recover')
+
+#%% md
+### 1.2 Loss and gradients, written out
+
+$$L = \frac{1}{N}\sum_i (\hat y_i - y_i)^2, \qquad
+\frac{\partial L}{\partial w} = \frac{2}{N}X^\top r, \qquad
+\frac{\partial L}{\partial b} = \frac{2}{N}\sum_i r_i, \qquad r = \hat y - y$$
+
+Then **check it numerically**. A finite-difference check takes four lines and catches sign
+errors, missing factors of 2, and transposed matrices. Do this every single time you
+hand-write a gradient.
+
+#%% code
+def predict(X, w, b):
+    return X @ w + b                      # (N, D) @ (D,) -> (N,)
+
+def mse_loss(X, y, w, b):
+    r = predict(X, w, b) - y
+    return float(np.mean(r ** 2))
+
+def mse_grad(X, y, w, b):
+    n = len(y)
+    r = predict(X, w, b) - y              # (N,) residual
+    dw = (2.0 / n) * (X.T @ r)            # (D, N) @ (N,) -> (D,)  same shape as w
+    db = (2.0 / n) * r.sum()
+    return dw, db
+
+
+w0 = np.array([0.4], dtype=np.float64)
+b0 = 0.2
+dw, db = mse_grad(X, y, w0, b0)
+print('analytic  dw =', dw, ' db =', round(db, 6))
+print('shape check: dw', dw.shape, '== w', w0.shape, '->', dw.shape == w0.shape)
+
+eps = 1e-5
+dw_num = np.array([(mse_loss(X, y, w0 + eps * e, b0) - mse_loss(X, y, w0 - eps * e, b0)) / (2 * eps)
+                   for e in np.eye(len(w0))])
+db_num = (mse_loss(X, y, w0, b0 + eps) - mse_loss(X, y, w0, b0 - eps)) / (2 * eps)
+
+print('numerical dw =', dw_num.round(6), ' db =', round(db_num, 6))
+print('max abs diff  =', max(np.abs(dw - dw_num).max(), abs(db - db_num)))
+assert np.allclose(dw, dw_num, atol=1e-4) and abs(db - db_num) < 1e-4
+print('gradient check PASSED')
+
+#%% md
+### 1.3 Gradient descent
+
+#%% code
+def gradient_descent(X, y, lr=0.1, epochs=60, w_init=0.0, b_init=0.0, record=True):
+    w = np.array([w_init], dtype=np.float64)
+    b = float(b_init)
+    history = {'loss': [], 'w': [], 'b': []}
+    for _ in range(epochs):
+        if record:
+            history['loss'].append(mse_loss(X, y, w, b))
+            history['w'].append(w[0]); history['b'].append(b)
+        dw, db = mse_grad(X, y, w, b)
+        w = w - lr * dw                   # the entire algorithm is these two lines
+        b = b - lr * db
+    history['loss'].append(mse_loss(X, y, w, b))
+    history['w'].append(w[0]); history['b'].append(b)
+    return w, b, history
+
+
+w_gd, b_gd, hist = gradient_descent(X, y, lr=0.1, epochs=60)
+print(f'learned  w = {w_gd[0]:.4f}  b = {b_gd:.4f}')
+print(f'truth    w = {TRUE_W}      b = {TRUE_B}')
+print(f'final loss {hist["loss"][-1]:.4f}  (noise floor is about {NOISE ** 2:.2f})')
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.4))
+axes[0].plot(hist['loss']); axes[0].set_xlabel('epoch'); axes[0].set_ylabel('MSE')
+axes[0].set_title('loss'); axes[0].grid(alpha=0.3)
+axes[1].plot(hist['w'], label='w'); axes[1].plot(hist['b'], label='b')
+axes[1].axhline(TRUE_W, ls='--', c='C0', alpha=0.5); axes[1].axhline(TRUE_B, ls='--', c='C1', alpha=0.5)
+axes[1].set_xlabel('epoch'); axes[1].set_title('parameters converging to the dashed truth')
+axes[1].legend(); axes[1].grid(alpha=0.3)
+plt.tight_layout()
+
+#%% md
+### 1.4 The closed form, as ground truth
+
+MSE + linear model is one of the rare cases with an exact solution. Use it to answer
+"is my optimizer working?" separately from "can my model fit this?".
+
+#%% code
+X_aug = np.hstack([X, np.ones((len(X), 1))])          # append a column of 1s for the bias
+theta, *_ = np.linalg.lstsq(X_aug, y, rcond=None)     # NOT inv(X.T @ X) - unstable
+w_exact, b_exact = theta[0], theta[1]
+
+print(f'closed form  w = {w_exact:.6f}  b = {b_exact:.6f}   loss = {mse_loss(X, y, np.array([w_exact]), b_exact):.6f}')
+print(f'grad descent w = {w_gd[0]:.6f}  b = {b_gd:.6f}   loss = {hist["loss"][-1]:.6f}')
+print(f'\ngap in loss: {hist["loss"][-1] - mse_loss(X, y, np.array([w_exact]), b_exact):.2e}  <- GD essentially converged')
+print('\nNote the closed form does NOT recover 2.5 / -1.0 exactly either:')
+print('with finite noisy data, the best-fit line is not the generating line. That gap is variance, not a bug.')
+
+#%% md
+### 1.5 Learning rate: watch it break
+
+#%% code
+lrs = [0.001, 0.01, 0.1, 0.3, 0.4]
+fig, ax = plt.subplots(figsize=(6, 3.8))
+for lr in lrs:
+    with np.errstate(over='ignore', invalid='ignore'):
+        _, _, h = gradient_descent(X, y, lr=lr, epochs=40)
+    losses = np.array(h['loss'])
+    final = losses[-1]
+    tag = 'DIVERGED' if (not np.isfinite(final) or final > 1e3) else f'{final:.3f}'
+    ax.plot(np.clip(losses, 1e-3, 1e4), marker='.', label=f'lr={lr}  final={tag}')
+ax.set_yscale('log'); ax.set_xlabel('epoch'); ax.set_ylabel('MSE (log scale)')
+ax.set_title('one hyperparameter, five behaviours'); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+plt.tight_layout()
+
+print('lr=0.001  too small: still far from the optimum after 40 epochs')
+print('lr=0.1    good')
+print('lr=0.3    overshoots and oscillates, but still converges')
+print('lr=0.4    diverges to inf, then nan. If you see nan, check the LR first.')
+print()
+print('This threshold is not magic. For MSE the Hessian is (2/N) X^T X, and gradient descent')
+print('is stable only while lr < 2 / lambda_max. Here x ~ U(-3, 3) so E[x^2] = 3,')
+print('lambda_max ~ 6, and the cutoff is lr ~ 0.33 - which is exactly what the plot shows.')
+print('Bigger inputs -> bigger curvature -> smaller usable LR. Another reason to normalize.')
+
+#%% md
+### 1.6 The loss surface, and the path taken
+
+For one weight and one bias the loss surface is 2D, so we can actually look at it. Real
+networks have millions of dimensions - but the intuition of "roll downhill, step size
+matters" survives the jump.
+
+#%% code
+w_grid = np.linspace(-1, 5, 120)
+b_grid = np.linspace(-4, 2, 120)
+WW, BB = np.meshgrid(w_grid, b_grid)
+Z = np.empty_like(WW)
+for i in range(WW.shape[0]):
+    for j in range(WW.shape[1]):
+        Z[i, j] = mse_loss(X, y, np.array([WW[i, j]]), BB[i, j])
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+for ax, lr in zip(axes, [0.05, 0.3]):
+    cs = ax.contour(WW, BB, Z, levels=np.geomspace(Z.min() + 1e-3, Z.max(), 18), cmap='viridis', alpha=0.7)
+    _, _, h = gradient_descent(X, y, lr=lr, epochs=40, w_init=-0.5, b_init=1.5)
+    ax.plot(h['w'], h['b'], 'r.-', ms=4, lw=1, label=f'GD path (lr={lr})')
+    ax.plot(w_exact, b_exact, 'w*', ms=14, mec='k', label='optimum')
+    ax.set_xlabel('w'); ax.set_ylabel('b'); ax.legend(fontsize=8); ax.set_title(f'lr = {lr}')
+plt.tight_layout()
+print('left: small steps, straight-ish descent. right: big steps, zig-zag across the valley.')
+
+#%% md
+### 1.7 Why feature scaling matters
+
+Two features on wildly different scales turn the bowl into a ravine. The learning rate has
+to be small enough for the steep direction, which makes it hopeless for the flat one.
+
+#%% code
+n = 200
+f1 = rng.uniform(0, 1, n)              # nice scale
+f2 = rng.uniform(0, 5000, n)           # awful scale
+Xb = np.stack([f1, f2], axis=1)
+yb = 3.0 * f1 + 0.002 * f2 + rng.normal(0, 0.1, n)
+
+def gd_multi(X, y, lr, epochs):
+    w = np.zeros(X.shape[1]); b = 0.0
+    losses = []
+    for _ in range(epochs):
+        losses.append(mse_loss(X, y, w, b))
+        dw, db = mse_grad(X, y, w, b)
+        w = w - lr * dw; b = b - lr * db
+        if not np.isfinite(losses[-1]):
+            break
+    return w, b, losses
+
+mu, sd = Xb.mean(0), Xb.std(0)
+Xs = (Xb - mu) / sd                    # standardize with TRAIN statistics
+print('raw    feature ranges:', Xb.max(0).round(1), '| std:', sd.round(1))
+print('scaled feature ranges:', Xs.max(0).round(2), '| std:', Xs.std(0).round(2))
+
+fig, ax = plt.subplots(figsize=(6, 3.6))
+with np.errstate(over='ignore', invalid='ignore'):
+    for label, data, lr in [('raw, lr=1e-8', Xb, 1e-8), ('raw, lr=1e-7', Xb, 1e-7), ('standardized, lr=0.1', Xs, 0.1)]:
+        _, _, ls = gd_multi(data, yb, lr, 200)
+        ax.plot(np.clip(ls, 1e-6, 1e6), label=label)
+ax.set_yscale('log'); ax.set_xlabel('epoch'); ax.set_ylabel('MSE'); ax.legend(fontsize=8)
+ax.set_title('same data, same optimizer, only the scaling differs'); ax.grid(alpha=0.3)
+plt.tight_layout()
+print('\nThis is why transforms.Normalize exists. It is not decoration.')
+
+#%% md
+## Part 2 - The same thing with PyTorch
+
+### 2.1 Tensors: a quick tour
+
+#%% code
+a = torch.tensor([[1., 2.], [3., 4.]])
+print('from data\n', a)
+print('\nzeros/randn/arange:', torch.zeros(2, 3).shape, torch.randn(2, 3).shape, torch.arange(6).reshape(2, 3).shape)
+print('shape', a.shape, '| dtype', a.dtype, '| device', a.device)
+
+npy = np.array([[1., 2.]], dtype=np.float32)
+t = torch.from_numpy(npy)
+t[0, 0] = 99.0
+print('\nfrom_numpy SHARES memory - numpy array is now', npy)
+
+print('\nnumpy-vs-torch naming:')
+x4 = torch.randn(8, 3, 16, 16)
+print('  x.mean(dim=(0,2,3))     ', tuple(x4.mean(dim=(0, 2, 3)).shape), ' (numpy: axis=)')
+print('  x.permute(0,2,3,1)      ', tuple(x4.permute(0, 2, 3, 1).shape), '(NCHW -> NHWC)')
+print('  x.reshape(8,-1)         ', tuple(x4.reshape(8, -1).shape))
+print('  x.unsqueeze(0)/squeeze()', tuple(x4.unsqueeze(0).shape))
+print('  torch.cat([x,x], dim=0) ', tuple(torch.cat([x4, x4], dim=0).shape), '(numpy: concatenate)')
+print('  x.float()/.long()       ', torch.arange(3).float().dtype, torch.arange(3).long().dtype)
+print('\nview vs reshape: view needs contiguous memory, reshape copies if it must')
+try:
+    x4.permute(0, 2, 3, 1).view(8, -1)
+except RuntimeError as e:
+    print('  permute().view() raises:', str(e).split('.')[0])
+print('  permute().reshape() works:', tuple(x4.permute(0, 2, 3, 1).reshape(8, -1).shape))
+
+#%% md
+### 2.2 Autograd
+
+Four rules: mark the parameter, run the forward pass, call `.backward()`, update inside
+`no_grad()` and zero the gradient. Let's verify autograd against calculus we can do in our heads.
+
+#%% code
+w = torch.tensor(3.0, requires_grad=True)
+f = w ** 3 + 2 * w          # df/dw = 3w^2 + 2 = 27 + 2 = 29
+f.backward()
+print(f'f(w) = w^3 + 2w at w=3 -> f = {f.item():.1f}, autograd df/dw = {w.grad.item():.1f}, by hand = 29')
+
+xx = torch.tensor([1.0, 2.0], requires_grad=True)
+g = (xx ** 2).sum()         # dg/dx = 2x = [2, 4]
+g.backward()
+print('g = sum(x^2), dg/dx =', xx.grad.tolist(), 'expected [2.0, 4.0]')
+
+print('\nbackward() needs a SCALAR:')
+v = torch.tensor([1.0, 2.0], requires_grad=True)
+try:
+    (v ** 2).backward()
+except RuntimeError as e:
+    print('  vector.backward() ->', str(e).split('.')[0], '<- you almost certainly forgot .mean() or .sum()')
+
+#%% code
+print('GRADIENTS ACCUMULATE - this is the bug everyone writes once:')
+p = torch.tensor(1.0, requires_grad=True)
+for step in range(3):
+    loss = (p * 2) ** 2                       # dloss/dp = 8p = 8 at p=1
+    loss.backward()
+    print(f'  step {step}: p.grad = {p.grad.item():5.1f}  <- should be 8.0 every time')
+
+p.grad = None
+print('\nwith zero_grad() (here: p.grad = None) between steps:')
+for step in range(3):
+    loss = (p * 2) ** 2
+    loss.backward()
+    print(f'  step {step}: p.grad = {p.grad.item():5.1f}')
+    p.grad.zero_()
+
+print('\nno_grad() switches tracking off - for updates, validation and inference:')
+q = torch.tensor(1.0, requires_grad=True)
+print('  inside graph :', (q * 2).requires_grad)
+with torch.no_grad():
+    print('  in no_grad() :', (q * 2).requires_grad)
+print('  .detach()    :', (q * 2).detach().requires_grad)
+
+#%% md
+### 2.3 Gradient descent with autograd, no `nn` yet
+
+Identical algorithm to part 1.3. The only change: we deleted `mse_grad` and let autograd
+derive it. Note that we recover the same numbers.
+
+#%% code
+Xt = torch.from_numpy(X.astype(np.float32))          # (N, 1)
+yt = torch.from_numpy(y.astype(np.float32))[:, None]  # (N, 1) - match the prediction shape
+
+w_t = torch.zeros(1, 1, requires_grad=True)
+b_t = torch.zeros(1, requires_grad=True)
+lr = 0.1
+
+losses = []
+for epoch in range(60):
+    pred = Xt @ w_t + b_t                  # forward
+    loss = ((pred - yt) ** 2).mean()       # MSE, by hand
+    loss.backward()                        # fills w_t.grad, b_t.grad
+    with torch.no_grad():                  # update OUTSIDE the graph
+        w_t -= lr * w_t.grad
+        b_t -= lr * b_t.grad
+    w_t.grad.zero_(); b_t.grad.zero_()     # or your next gradient is the sum of both
+    losses.append(loss.item())             # .item() - NOT loss, which would keep the graph alive
+
+print(f'autograd  w = {w_t.item():.6f}  b = {b_t.item():.6f}')
+print(f'numpy GD  w = {w_gd[0]:.6f}  b = {b_gd:.6f}')
+print(f'closed    w = {w_exact:.6f}  b = {b_exact:.6f}')
+print('\nSame answer, and we never wrote a derivative.')
+
+#%% md
+### 2.4 The canonical loop: `nn.Module` + optimizer
+
+Now the version you will actually write. `nn.Linear` holds the parameters, `nn.MSELoss` is
+the loss, `torch.optim.SGD` owns the update rule. **Memorise the five steps.**
+
+#%% code
+model = nn.Linear(in_features=1, out_features=1)
+criterion = nn.MSELoss()
+optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+print('parameters:', [f'{n}: {tuple(p.shape)}' for n, p in model.named_parameters()])
+print('initialized to', model.weight.item(), model.bias.item(), '(random, not zero)')
+
+losses_nn = []
+for epoch in range(60):
+    model.train()
+    optimizer.zero_grad()          # 1
+    pred = model(Xt)               # 2
+    loss = criterion(pred, yt)     # 3
+    loss.backward()                # 4
+    optimizer.step()               # 5
+    losses_nn.append(loss.item())
+
+print(f'\nnn.Linear  w = {model.weight.item():.6f}  b = {model.bias.item():.6f}')
+print(f'closed     w = {w_exact:.6f}  b = {b_exact:.6f}')
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.4))
+axes[0].plot(losses, label='hand-rolled autograd'); axes[0].plot(losses_nn, '--', label='nn.Linear + SGD')
+axes[0].set_xlabel('epoch'); axes[0].set_ylabel('MSE'); axes[0].legend(); axes[0].grid(alpha=0.3)
+axes[0].set_title('same optimization, two spellings')
+axes[1].scatter(x, y, s=12, alpha=0.6)
+with torch.no_grad():
+    xs_t = torch.linspace(-3, 3, 100)[:, None]
+    axes[1].plot(xs_t.numpy(), model(xs_t).numpy(), 'r', lw=2, label='fitted')
+axes[1].plot(xs, TRUE_W * xs + TRUE_B, 'k--', alpha=0.6, label='truth')
+axes[1].legend(); axes[1].grid(alpha=0.3); axes[1].set_title('the fit')
+plt.tight_layout()
+
+#%% md
+### 2.5 Mini-batches with `TensorDataset` + `DataLoader`
+
+Batch GD used all 120 points per step. Real datasets don't fit in memory, so we iterate over
+mini-batches. This is the loop shape from chapter 4 onwards.
+
+#%% code
+from torch.utils.data import TensorDataset, DataLoader
+
+ds = TensorDataset(Xt, yt)
+loader = DataLoader(ds, batch_size=16, shuffle=True)
+
+print(f'{len(ds)} samples, batch_size=16 -> {len(loader)} steps per epoch')
+xb, yb = next(iter(loader))
+print('one batch:', tuple(xb.shape), tuple(yb.shape))
+
+model_mb = nn.Linear(1, 1)
+opt_mb = torch.optim.SGD(model_mb.parameters(), lr=0.05)
+crit = nn.MSELoss()
+
+epoch_losses = []
+for epoch in range(30):
+    model_mb.train()
+    running, seen = 0.0, 0
+    for xb, yb in loader:
+        opt_mb.zero_grad()
+        loss = crit(model_mb(xb), yb)
+        loss.backward()
+        opt_mb.step()
+        running += loss.item() * len(xb)      # weight by batch size...
+        seen += len(xb)
+    epoch_losses.append(running / seen)        # ...so the average is over samples, not batches
+
+print(f'\nmini-batch  w = {model_mb.weight.item():.4f}  b = {model_mb.bias.item():.4f}')
+plt.figure(figsize=(5.5, 3.2))
+plt.plot(epoch_losses, marker='.'); plt.xlabel('epoch'); plt.ylabel('mean MSE')
+plt.title('mini-batch SGD (noisier per step, same destination)'); plt.grid(alpha=0.3)
+print('The last batch may be smaller than 16 - that is why we weight by len(xb).')
+
+#%% md
+## Part 3 - Logistic regression: classification
+
+### 3.1 Two blobs, one boundary
+
+#%% code
+def make_blobs(n=300, seed=1):
+    r = np.random.default_rng(seed)
+    n0 = n // 2
+    a = r.normal([-1.4, -0.6], [1.0, 0.9], size=(n0, 2))
+    b = r.normal([1.5, 1.0], [1.0, 0.9], size=(n - n0, 2))
+    Xc = np.vstack([a, b]).astype(np.float32)
+    yc = np.concatenate([np.zeros(n0), np.ones(n - n0)]).astype(np.float32)
+    idx = r.permutation(n)
+    return Xc[idx], yc[idx]
+
+Xc, yc = make_blobs()
+split = int(0.75 * len(Xc))
+Xc_tr, Xc_va = Xc[:split], Xc[split:]
+yc_tr, yc_va = yc[:split], yc[split:]
+print('train', Xc_tr.shape, '| val', Xc_va.shape, '| class balance', np.bincount(yc.astype(int)))
+
+plt.figure(figsize=(4.6, 3.8))
+plt.scatter(*Xc_tr[yc_tr == 0].T, s=14, label='class 0')
+plt.scatter(*Xc_tr[yc_tr == 1].T, s=14, label='class 1')
+plt.legend(); plt.grid(alpha=0.3); plt.title('linearly separable-ish'); plt.xlabel('x1'); plt.ylabel('x2')
+
+#%% md
+### 3.2 Sigmoid and BCE from scratch
+
+$\sigma(z) = 1/(1+e^{-z})$, and the gradient is *the same form as linear regression*:
+$\nabla_w = \frac{1}{N}X^\top(\hat p - y)$. Once you notice that, the whole family clicks.
+
+#%% code
+def sigmoid(z):
+    return 1.0 / (1.0 + np.exp(-np.clip(z, -60, 60)))     # clip: exp(750) overflows
+
+def bce(p, y, eps=1e-9):
+    p = np.clip(p, eps, 1 - eps)                          # log(0) = -inf
+    return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
+
+w_l = np.zeros(2); b_l = 0.0
+lr, hist_l = 0.5, {'loss': [], 'acc': []}
+for epoch in range(300):
+    z = Xc_tr @ w_l + b_l
+    p = sigmoid(z)
+    hist_l['loss'].append(bce(p, yc_tr))
+    hist_l['acc'].append(float(((p > 0.5) == yc_tr).mean()))
+    grad_w = (Xc_tr.T @ (p - yc_tr)) / len(yc_tr)         # identical shape to linear regression
+    grad_b = float(np.mean(p - yc_tr))
+    w_l -= lr * grad_w; b_l -= lr * grad_b
+
+print(f'from scratch: w = {w_l.round(3)}  b = {b_l:.3f}')
+print(f'train BCE {hist_l["loss"][-1]:.4f} | train acc {hist_l["acc"][-1]:.3f}')
+print(f'val   acc {float(((sigmoid(Xc_va @ w_l + b_l) > 0.5) == yc_va).mean()):.3f}')
+
+zs = np.linspace(-8, 8, 200)
+fig, axes = plt.subplots(1, 3, figsize=(12, 3.2))
+axes[0].plot(zs, sigmoid(zs)); axes[0].axhline(0.5, ls=':', c='k'); axes[0].axvline(0, ls=':', c='k')
+axes[0].set_title('sigmoid: logit -> probability'); axes[0].set_xlabel('z'); axes[0].grid(alpha=0.3)
+axes[1].plot(hist_l['loss']); axes[1].set_title('BCE'); axes[1].set_xlabel('epoch'); axes[1].grid(alpha=0.3)
+axes[2].plot(hist_l['acc']); axes[2].set_title('train accuracy'); axes[2].set_xlabel('epoch'); axes[2].grid(alpha=0.3)
+plt.tight_layout()
+
+#%% md
+### 3.3 The same model in PyTorch, with `BCEWithLogitsLoss`
+
+The model outputs **logits** - raw scores. We never apply the sigmoid ourselves before the
+loss; the fused version is numerically stable.
+
+#%% code
+Xc_tr_t = torch.from_numpy(Xc_tr); yc_tr_t = torch.from_numpy(yc_tr)[:, None]
+Xc_va_t = torch.from_numpy(Xc_va); yc_va_t = torch.from_numpy(yc_va)[:, None]
+
+clf = nn.Linear(2, 1)                       # 1 output = 1 logit
+criterion = nn.BCEWithLogitsLoss()          # sigmoid + BCE fused
+optimizer = torch.optim.SGD(clf.parameters(), lr=0.5)
+
+hist = {'train_loss': [], 'val_loss': [], 'val_acc': []}
+for epoch in range(300):
+    clf.train()
+    optimizer.zero_grad()
+    loss = criterion(clf(Xc_tr_t), yc_tr_t)
+    loss.backward()
+    optimizer.step()
+
+    clf.eval()
+    with torch.no_grad():
+        vlogits = clf(Xc_va_t)
+        hist['train_loss'].append(loss.item())
+        hist['val_loss'].append(criterion(vlogits, yc_va_t).item())
+        hist['val_acc'].append(((vlogits > 0).float() == yc_va_t).float().mean().item())
+
+print(f'torch   w = {clf.weight.detach().numpy().round(3)}  b = {clf.bias.item():.3f}')
+print(f'scratch w = {w_l.round(3)}  b = {b_l:.3f}   <- same answer')
+print(f'\nfinal val acc {hist["val_acc"][-1]:.3f}')
+print('prediction rule: (logits > 0) is exactly (sigmoid(logits) > 0.5) - no sigmoid needed')
+
+#%% code
+def plot_boundary(ax, predict_fn, X, y, title):
+    pad = 1.0
+    x1 = np.linspace(X[:, 0].min() - pad, X[:, 0].max() + pad, 240)
+    x2 = np.linspace(X[:, 1].min() - pad, X[:, 1].max() + pad, 240)
+    G1, G2 = np.meshgrid(x1, x2)
+    grid = np.stack([G1.ravel(), G2.ravel()], axis=1).astype(np.float32)
+    P = predict_fn(grid).reshape(G1.shape)
+    cs = ax.contourf(G1, G2, P, levels=20, cmap='RdBu_r', alpha=0.65, vmin=0, vmax=1)
+    ax.contour(G1, G2, P, levels=[0.5], colors='k', linewidths=1.5)
+    ax.scatter(*X[y == 0].T, s=12, c='C0', edgecolor='k', linewidth=0.3, label='0')
+    ax.scatter(*X[y == 1].T, s=12, c='C3', edgecolor='k', linewidth=0.3, label='1')
+    ax.set_title(title); ax.legend(fontsize=8)
+    return cs
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+with torch.no_grad():
+    torch_prob = lambda g: torch.sigmoid(clf(torch.from_numpy(g))).numpy().ravel()
+    cs = plot_boundary(axes[0], torch_prob, Xc_va, yc_va, 'torch model, validation points')
+plot_boundary(axes[1], lambda g: sigmoid(g @ w_l + b_l), Xc_va, yc_va, 'from-scratch model')
+fig.colorbar(cs, ax=axes, shrink=0.85, label='P(class 1)')
+print('The black line is where the logit is 0. Colour is the predicted probability -')
+print('note it is smooth: the model is more confident far from the boundary.')
+
+#%% md
+### 3.4 Why `BCEWithLogitsLoss` and not `sigmoid` + `BCELoss`
+
+#%% code
+big = torch.tensor([[-100.0], [100.0]])
+target = torch.tensor([[1.0], [0.0]])            # confidently, maximally wrong
+
+unstable = nn.BCELoss()(torch.sigmoid(big), target)
+stable = nn.BCEWithLogitsLoss()(big, target)
+print('sigmoid + BCELoss   :', unstable.item(), '<- inf or clipped garbage')
+print('BCEWithLogitsLoss   :', stable.item(), '<- correct: 100.0')
+print('\nsigmoid(-100) rounds to exactly 0.0 in float32, and log(0) = -inf.')
+print('The fused loss uses the log-sum-exp trick and never materialises that 0.')
+
+print('\nthe same trap in multi-class form:')
+logits3 = torch.randn(4, 3)
+tgt3 = torch.tensor([0, 2, 1, 1])
+print('  CORRECT: CrossEntropyLoss()(logits, target)      ->', round(nn.CrossEntropyLoss()(logits3, tgt3).item(), 4))
+print('  WRONG:   CrossEntropyLoss()(softmax(logits), t)  ->', round(nn.CrossEntropyLoss()(torch.softmax(logits3, 1), tgt3).item(), 4))
+print('  The wrong one does not crash. It just trains badly - softmax applied twice.')
+
+#%% md
+### 3.5 Accuracy is not enough
+
+#%% code
+def confusion(y_true, y_pred, k=2):
+    return np.bincount(y_true.astype(int) * k + y_pred.astype(int), minlength=k * k).reshape(k, k)
+
+with torch.no_grad():
+    val_logits = clf(Xc_va_t).numpy().ravel()
+val_pred = (val_logits > 0).astype(int)
+cm = confusion(yc_va, val_pred)
+tn, fp, fn, tp = cm.ravel()
+
+precision = tp / max(tp + fp, 1)
+recall = tp / max(tp + fn, 1)
+f1 = 2 * precision * recall / max(precision + recall, 1e-9)
+print('confusion matrix (rows = actual, cols = predicted)\n', cm)
+print(f'\naccuracy  {(tp + tn) / cm.sum():.3f}')
+print(f'precision {precision:.3f}  (of what I flagged as 1, how much was really 1)')
+print(f'recall    {recall:.3f}  (of the real 1s, how many did I catch)')
+print(f'f1        {f1:.3f}')
+
+print('\nmoving the threshold trades precision against recall:')
+print(f'{"thresh":>7} {"precis":>7} {"recall":>7} {"acc":>6}')
+for thr in [0.2, 0.35, 0.5, 0.65, 0.8]:
+    pr = (1 / (1 + np.exp(-val_logits)) > thr).astype(int)
+    c = confusion(yc_va, pr)
+    tn2, fp2, fn2, tp2 = c.ravel()
+    print(f'{thr:7.2f} {tp2 / max(tp2 + fp2, 1):7.3f} {tp2 / max(tp2 + fn2, 1):7.3f} {(tp2 + tn2) / c.sum():6.3f}')
+print('\nThe threshold is a business decision, not a model parameter.')
+
+#%% md
+### 3.6 Why accuracy lies: an imbalanced example
+
+#%% code
+r = np.random.default_rng(5)
+n_imb = 1000
+y_imb = (r.random(n_imb) < 0.02).astype(int)          # 2% positive
+pred_lazy = np.zeros(n_imb, dtype=int)                # "always predict the majority"
+
+c = confusion(y_imb, pred_lazy)
+print('a model that always predicts 0:')
+print('  accuracy ', round((c[0, 0] + c[1, 1]) / c.sum(), 4), '<- looks great')
+print('  recall   ', round(c[1, 1] / max(c[1].sum(), 1), 4), '<- catches nothing')
+print('  positives in data:', y_imb.sum(), 'of', n_imb)
+print('\nThis is the shape of most real problems: defects, disease, fraud, and')
+print('every segmentation mask you will meet in chapter 6.')
+
+#%% md
+## Part 4 - Multi-class on real images: softmax regression on digits
+
+`sklearn`'s digits dataset: 1797 handwritten digits, 8x8 grayscale. Small, built in, no
+download - and it is a genuine image classification problem. Our model: flatten to 64
+features, one linear layer to 10 logits, cross-entropy.
+
+#%% code
+from sklearn.datasets import load_digits
+
+digits = load_digits()
+Xd = digits.data.astype(np.float32)          # (1797, 64), values 0..16
+yd = digits.target.astype(np.int64)
+images = digits.images                       # (1797, 8, 8) for plotting
+
+print('X', Xd.shape, '| y', yd.shape, '| classes', np.unique(yd))
+print('class counts', np.bincount(yd))
+
+perm = np.random.default_rng(0).permutation(len(Xd))
+Xd, yd, images = Xd[perm], yd[perm], images[perm]
+ntr = int(0.8 * len(Xd))
+Xd_tr, Xd_va = Xd[:ntr], Xd[ntr:]
+yd_tr, yd_va = yd[:ntr], yd[ntr:]
+
+mu, sd = Xd_tr.mean(0), Xd_tr.std(0) + 1e-6     # TRAIN stats only
+Xd_tr_s, Xd_va_s = (Xd_tr - mu) / sd, (Xd_va - mu) / sd
+print('\nstandardized with train stats. train', Xd_tr_s.shape, 'val', Xd_va_s.shape)
+
+fig, axes = plt.subplots(2, 8, figsize=(11, 3))
+for ax, i in zip(axes.ravel(), range(16)):
+    ax.imshow(images[i], cmap='gray'); ax.set_title(int(yd[i]), fontsize=9); ax.axis('off')
+plt.suptitle('8x8 digits'); plt.tight_layout()
+
+#%% code
+def train_softmax(Xtr, ytr, Xva, yva, epochs=120, lr=0.1, weight_decay=0.0, n_classes=10, seed=0, verbose=True):
+    """The canonical loop, wrapped up so we can reuse it. Returns (model, history)."""
+    torch.manual_seed(seed)
+    Xtr_t = torch.from_numpy(np.ascontiguousarray(Xtr, dtype=np.float32))
+    ytr_t = torch.from_numpy(ytr)                       # int64 - CrossEntropyLoss wants class ids
+    Xva_t = torch.from_numpy(np.ascontiguousarray(Xva, dtype=np.float32))
+    yva_t = torch.from_numpy(yva)
+
+    model = nn.Linear(Xtr.shape[1], n_classes)
+    criterion = nn.CrossEntropyLoss()                   # takes LOGITS
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    h = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
+    for epoch in range(epochs):
+        model.train()
+        optimizer.zero_grad()
+        logits = model(Xtr_t)                           # (N, 10)
+        loss = criterion(logits, ytr_t)
+        loss.backward()
+        optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            vlogits = model(Xva_t)
+            h['train_loss'].append(loss.item())
+            h['val_loss'].append(criterion(vlogits, yva_t).item())
+            h['train_acc'].append((logits.argmax(1) == ytr_t).float().mean().item())
+            h['val_acc'].append((vlogits.argmax(1) == yva_t).float().mean().item())
+        if verbose and (epoch + 1) % 30 == 0:
+            print(f'  epoch {epoch + 1:4d}  train {h["train_loss"][-1]:.4f}  '
+                  f'val {h["val_loss"][-1]:.4f}  val acc {h["val_acc"][-1]:.4f}')
+    return model, h
+
+
+print('training softmax regression on digits:')
+digit_model, dh = train_softmax(Xd_tr_s, yd_tr, Xd_va_s, yd_va, epochs=120, lr=0.1)
+print(f'\nfinal val accuracy {dh["val_acc"][-1]:.4f} with {sum(p.numel() for p in digit_model.parameters())} parameters')
+print('(64*10 weights + 10 biases = 650)')
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.4))
+axes[0].plot(dh['train_loss'], label='train'); axes[0].plot(dh['val_loss'], label='val')
+axes[0].set_xlabel('epoch'); axes[0].set_ylabel('cross-entropy'); axes[0].legend(); axes[0].grid(alpha=0.3)
+axes[1].plot(dh['train_acc'], label='train'); axes[1].plot(dh['val_acc'], label='val')
+axes[1].set_xlabel('epoch'); axes[1].set_ylabel('accuracy'); axes[1].legend(); axes[1].grid(alpha=0.3)
+axes[0].set_title('loss'); axes[1].set_title('accuracy')
+plt.tight_layout()
+
+#%% code
+with torch.no_grad():
+    val_logits = digit_model(torch.from_numpy(Xd_va_s))
+    val_pred = val_logits.argmax(1).numpy()
+    val_prob = torch.softmax(val_logits, dim=1).numpy()
+
+cm = confusion(yd_va, val_pred, k=10)
+print('confusion matrix, rows = actual, cols = predicted')
+print('    ' + ' '.join(f'{i:4d}' for i in range(10)))
+for i in range(10):
+    print(f'{i:2d}  ' + ' '.join(f'{v:4d}' for v in cm[i]))
+
+per_class = np.diag(cm) / np.maximum(cm.sum(1), 1)
+print('\nper-class recall:', {i: round(float(v), 3) for i, v in enumerate(per_class)})
+print('worst class:', int(per_class.argmin()), 'at', round(float(per_class.min()), 3))
+off = cm.copy(); np.fill_diagonal(off, 0)
+i, j = np.unravel_index(off.argmax(), off.shape)
+print(f'most common confusion: true {i} predicted as {j} ({off[i, j]} times)')
+
+#%% code
+wrong = np.where(val_pred != yd_va)[0]
+print(f'{len(wrong)} mistakes out of {len(yd_va)}')
+
+order = wrong[np.argsort(-val_prob[wrong].max(1))]        # most confident mistakes first
+fig, axes = plt.subplots(2, 6, figsize=(11, 4))
+for ax, idx in zip(axes.ravel(), order[:12]):
+    ax.imshow(images[ntr + idx], cmap='gray')
+    ax.set_title(f'true {yd_va[idx]} / pred {val_pred[idx]}\np={val_prob[idx].max():.2f}', fontsize=8)
+    ax.axis('off')
+for ax in axes.ravel()[len(order[:12]):]:
+    ax.axis('off')
+plt.suptitle('the most confident mistakes - look at these, every project')
+plt.tight_layout()
+
+#%% code
+fig, axes = plt.subplots(2, 5, figsize=(11, 4.4))
+W = digit_model.weight.detach().numpy()                   # (10, 64)
+for k, ax in enumerate(axes.ravel()):
+    im = ax.imshow(W[k].reshape(8, 8), cmap='RdBu_r', vmin=-abs(W).max(), vmax=abs(W).max())
+    ax.set_title(f'class {k}', fontsize=9); ax.axis('off')
+fig.colorbar(im, ax=axes, shrink=0.7)
+plt.suptitle('learned weights, reshaped to 8x8: red = evidence for, blue = against')
+print('You can genuinely read the templates: class 0 wants a dark centre, class 1 a vertical stroke.')
+print('This is as much structure as a linear model can express.')
+
+#%% md
+## Part 5 - Overfitting and weight decay
+
+Fewer training samples than parameters is the classic recipe. Watch the val loss turn back
+up while the train loss keeps dropping.
+
+#%% code
+small_n = 120                       # 120 samples, 650 parameters
+Xs_tr, ys_tr = Xd_tr_s[:small_n], yd_tr[:small_n]
+
+print('no regularization:')
+_, h_over = train_softmax(Xs_tr, ys_tr, Xd_va_s, yd_va, epochs=600, lr=0.2, weight_decay=0.0, verbose=False)
+print(f'  train acc {h_over["train_acc"][-1]:.3f}  val acc {h_over["val_acc"][-1]:.3f}')
+print(f'  best val loss {min(h_over["val_loss"]):.4f} at epoch {int(np.argmin(h_over["val_loss"]))}, final {h_over["val_loss"][-1]:.4f}')
+
+print('\nwith weight_decay=0.05:')
+_, h_wd = train_softmax(Xs_tr, ys_tr, Xd_va_s, yd_va, epochs=600, lr=0.2, weight_decay=0.05, verbose=False)
+print(f'  train acc {h_wd["train_acc"][-1]:.3f}  val acc {h_wd["val_acc"][-1]:.3f}')
+print(f'  best val loss {min(h_wd["val_loss"]):.4f}, final {h_wd["val_loss"][-1]:.4f}')
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.6))
+for ax, (h, name) in zip(axes, [(h_over, 'no weight decay'), (h_wd, 'weight_decay=0.05')]):
+    ax.plot(h['train_loss'], label='train loss')
+    ax.plot(h['val_loss'], label='val loss')
+    best = int(np.argmin(h['val_loss']))
+    ax.axvline(best, ls=':', c='k', label=f'best val @ {best}')
+    ax.set_xlabel('epoch'); ax.set_ylabel('cross-entropy'); ax.set_title(name)
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+plt.tight_layout()
+print('\nThe gap between the curves IS the overfitting. Early stopping = stop at the dotted line.')
+
+#%% md
+## Part 6 - The punchline: a linear model cannot see geometry
+
+Apply one fixed random permutation to all 64 pixels of every image. To a human the images
+become noise. To a linear model on flattened pixels, **nothing has changed** - it just
+relabels which input goes with which weight.
+
+#%% code
+pix_perm = np.random.default_rng(7).permutation(64)
+Xd_tr_p = Xd_tr_s[:, pix_perm]
+Xd_va_p = Xd_va_s[:, pix_perm]
+
+_, h_orig = train_softmax(Xd_tr_s, yd_tr, Xd_va_s, yd_va, epochs=120, lr=0.1, verbose=False)
+_, h_perm = train_softmax(Xd_tr_p, yd_tr, Xd_va_p, yd_va, epochs=120, lr=0.1, verbose=False)
+
+print(f'original pixel order : val acc {h_orig["val_acc"][-1]:.4f}')
+print(f'pixels shuffled      : val acc {h_perm["val_acc"][-1]:.4f}')
+print('\nIdentical (to within optimizer noise). The model never used the fact that pixels')
+print('have neighbours - so destroying the neighbourhoods costs it nothing.')
+
+fig, axes = plt.subplots(1, 4, figsize=(10, 2.8))
+for k in range(2):
+    axes[2 * k].imshow(images[k], cmap='gray'); axes[2 * k].set_title(f'digit {yd[k]}', fontsize=9)
+    axes[2 * k + 1].imshow(images[k].ravel()[pix_perm].reshape(8, 8), cmap='gray')
+    axes[2 * k + 1].set_title('pixels shuffled', fontsize=9)
+for ax in axes: ax.axis('off')
+plt.tight_layout()
+
+#%% code
+shift_acc = []
+for shift in range(4):
+    shifted_tr = np.roll(Xd_tr_s.reshape(-1, 8, 8), shift, axis=2).reshape(-1, 64)
+    with torch.no_grad():
+        logits = digit_model(torch.from_numpy(np.ascontiguousarray(shifted_tr, dtype=np.float32)))
+        shift_acc.append(float((logits.argmax(1).numpy() == yd_tr).mean()))
+
+print('accuracy of the trained model when the test digit is shifted right by k pixels:')
+for k, a in enumerate(shift_acc):
+    print(f'  shift {k}px: {a:.3f}')
+print('\nIt collapses. A 2-pixel shift is a completely different input to a linear model,')
+print('because weight (0,0) has no idea it is adjacent to weight (0,1).')
+print('\nConvolution fixes exactly these two problems, with local connections and shared weights.')
+
+#%% md
+## What to remember
+
+**The five steps, in order** - write them on your hand:
+
+```python
+optimizer.zero_grad()      # 1  gradients accumulate; clear them
+pred = model(xb)           # 2  forward
+loss = criterion(pred, yb) # 3  compare
+loss.backward()            # 4  fill .grad for every parameter
+optimizer.step()           # 5  apply the update rule
+```
+
+| Idea | The one-liner |
+|---|---|
+| Gradient shape | always equals the parameter's shape - check it |
+| Learning rate | too big -> nan; too small -> "it can't learn". Check it first |
+| Feature scaling | standardize with **train** stats; images: `Normalize(mean, std)` |
+| `requires_grad` | marks a leaf; everything downstream is tracked |
+| `.backward()` | needs a scalar; `.mean()` is usually the missing piece |
+| `zero_grad()` | omit it and gradients silently sum across steps |
+| `no_grad()` | for updates, validation, inference. Saves memory too |
+| `.item()` | log this, never the tensor (which holds the graph alive) |
+| Losses take logits | `BCEWithLogitsLoss`, `CrossEntropyLoss` - never pre-apply sigmoid/softmax |
+| CrossEntropy dtypes | logits `(N,C)` float32, target `(N,)` int64 |
+| Predictions | `logits > 0` binary, `logits.argmax(1)` multi-class |
+| Accuracy | insufficient on imbalanced data; know precision/recall |
+| Overfitting | train down, val up. Look at the two curves, every run |
+| Linear on pixels | blind to geometry and to translation -> chapter 3 |
+
+Now do [`exercises/ex02_regression.ipynb`](../exercises/ex02_regression.ipynb),
+then [chapter 3](../docs/03_convolution.md).

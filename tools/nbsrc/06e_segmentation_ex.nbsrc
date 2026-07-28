@@ -1,0 +1,474 @@
+#out exercises/ex06_segmentation.ipynb
+#gpu on
+
+#%% md
+# Exercise 6 - Semantic segmentation
+
+> **GPU: Runtime -> Change runtime type -> T4 GPU.** About 4 minutes.
+
+Eight tasks. The dataset here is **binary** (foreground vs background) with elliptical blobs and
+distractor texture - deliberately different from the lesson's 4-class shapes, and deliberately
+imbalanced so the metrics matter.
+
+The setup cell gives you the data. Everything else is yours.
+
+#%% code
+import time, math
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image, ImageDraw
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print('torch', torch.__version__, '| device', device)
+if device.type != 'cuda':
+    print('*** no GPU: switch the runtime, or reduce EPOCHS ***')
+
+try:
+    import google.colab  # noqa: F401
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+NUM_WORKERS = 2 if IN_COLAB else 0
+
+def set_seed(seed=0):
+    import random
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+set_seed(0)
+torch.backends.cudnn.benchmark = True
+plt.rcParams['figure.dpi'] = 110
+
+IMG_SIZE = 96
+N_CLASSES = 2                       # 0 = background, 1 = blob
+CLASS_NAMES = ['background', 'blob']
+
+def make_sample(rng, size=IMG_SIZE):
+    """Small bright ellipses on a textured background. Returns (HWC float32, HW int64)."""
+    img = Image.new('L', (size, size), int(rng.integers(25, 60)))
+    mask = Image.new('L', (size, size), 0)
+    d, dm = ImageDraw.Draw(img), ImageDraw.Draw(mask)
+    for _ in range(int(rng.integers(4, 10))):            # distractors: dim, NOT labelled
+        x, y = int(rng.integers(0, size)), int(rng.integers(0, size))
+        r = int(rng.integers(3, 9))
+        d.ellipse([x - r, y - r, x + r, y + r], fill=int(rng.integers(60, 95)))
+    for _ in range(int(rng.integers(1, 4))):             # targets: bright, labelled 1
+        w, h = int(rng.integers(10, 26)), int(rng.integers(10, 26))
+        x0, y0 = int(rng.integers(0, size - w)), int(rng.integers(0, size - h))
+        box = [x0, y0, x0 + w, y0 + h]
+        d.ellipse(box, fill=int(rng.integers(190, 255)))
+        dm.ellipse(box, fill=1)
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    arr = np.clip(arr + rng.normal(0, 0.05, arr.shape).astype(np.float32), 0, 1)
+    return np.stack([arr] * 3, axis=-1), np.asarray(mask, dtype=np.int64)
+
+
+class BlobDataset(Dataset):
+    def __init__(self, n, seed=0, augment=False):
+        rng = np.random.default_rng(seed)
+        self.items = [make_sample(rng) for _ in range(n)]
+        self.augment = augment
+        self.rng = np.random.default_rng(seed + 555)
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, i):
+        img, mask = self.items[i]
+        if self.augment:
+            img, mask = paired_augment(img, mask, self.rng)
+        return (torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1))),
+                torch.from_numpy(np.ascontiguousarray(mask)))
+
+train_ds_raw = BlobDataset(500, seed=0)
+val_ds = BlobDataset(120, seed=777)
+all_val_masks = np.stack([m for _, m in val_ds.items])
+fg = float((all_val_masks > 0).mean())
+print(f'\ntrain {len(train_ds_raw)} | val {len(val_ds)} | image {IMG_SIZE}x{IMG_SIZE}')
+print(f'foreground is {100 * fg:.1f}% of pixels -> background is {100 * (1 - fg):.1f}%')
+print('That imbalance is the point of this exercise.')
+
+fig, axes = plt.subplots(2, 6, figsize=(13, 4.4))
+for c in range(6):
+    im, mk = val_ds.items[c]
+    axes[0, c].imshow(im); axes[1, c].imshow(mk, cmap='magma', vmin=0, vmax=1)
+for ax in axes.ravel(): ax.axis('off')
+plt.suptitle('top: image (bright blobs = class 1, dim blobs = distractors). bottom: mask')
+plt.tight_layout()
+
+#%% md
+---
+## Task 1 - Paired augmentation
+
+Write `paired_augment(img, mask, rng)` applying the **same** geometric transform to both:
+
+- horizontal flip with probability 0.5
+- vertical flip with probability 0.5
+- a random 90-degree rotation (0, 1, 2 or 3 quarter turns)
+
+Return contiguous arrays. The assertion checks alignment survives by comparing where the image is
+bright against where the mask is set - if you transform them independently, that agreement
+collapses.
+
+#%% code
+def paired_augment(img, mask, rng):
+    """img (H,W,3) float32, mask (H,W) int64 -> the same pair, identically transformed."""
+    # TODO
+    raise NotImplementedError
+
+
+img0, mask0 = val_ds.items[0]
+
+def alignment(img, mask):
+    bright = img.mean(-1) > 0.6
+    return float((bright & (mask > 0)).sum() / max((mask > 0).sum(), 1))
+
+base_align = alignment(img0, mask0)
+for trial in range(6):
+    a, b = paired_augment(img0, mask0, np.random.default_rng(trial))
+    assert a.shape == img0.shape and b.shape == mask0.shape, f'shapes changed: {a.shape} {b.shape}'
+    assert b.dtype == np.int64, f'mask dtype became {b.dtype} - it must stay int64'
+    assert set(np.unique(b).tolist()) <= {0, 1}, 'mask values must stay 0/1'
+    assert a.flags['C_CONTIGUOUS'] and b.flags['C_CONTIGUOUS'], 'return contiguous arrays'
+    assert abs(alignment(a, b) - base_align) < 0.05, \
+        f'trial {trial}: alignment {alignment(a, b):.3f} vs {base_align:.3f} - image and mask disagree'
+assert abs(alignment(*paired_augment(img0, mask0, np.random.default_rng(3))) - base_align) < 0.05
+print(f'PASS  alignment preserved across 6 random transforms (baseline {base_align:.3f})')
+
+train_ds = BlobDataset(500, seed=0, augment=True)
+train_loader = DataLoader(train_ds, batch_size=16, shuffle=True, num_workers=NUM_WORKERS,
+                          pin_memory=device.type == 'cuda', drop_last=True)
+val_loader = DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=NUM_WORKERS,
+                        pin_memory=device.type == 'cuda')
+xb, yb = next(iter(train_loader))
+assert xb.shape == (16, 3, IMG_SIZE, IMG_SIZE) and yb.shape == (16, IMG_SIZE, IMG_SIZE)
+assert yb.dtype == torch.int64
+print(f'      batch x {tuple(xb.shape)} | y {tuple(yb.shape)} {yb.dtype}')
+
+#%% md
+---
+## Task 2 - Metrics from a confusion matrix
+
+Implement:
+
+1. `confusion_matrix(target, pred, k)` - rows actual, cols predicted, via `np.bincount`.
+2. `iou_from_cm(cm)` -> `(k,)`, `np.nan` where a class is absent from both truth and prediction.
+3. `dice_from_cm(cm)` -> `(k,)`, same NaN convention.
+4. `pixel_accuracy(cm)` -> float.
+
+Then the cell shows you what a do-nothing model scores.
+
+#%% code
+def confusion_matrix(target, pred, k=N_CLASSES):
+    # TODO
+    raise NotImplementedError
+
+def iou_from_cm(cm):
+    # TODO
+    raise NotImplementedError
+
+def dice_from_cm(cm):
+    # TODO
+    raise NotImplementedError
+
+def pixel_accuracy(cm):
+    # TODO
+    raise NotImplementedError
+
+
+perfect = confusion_matrix(all_val_masks, all_val_masks)
+assert perfect.shape == (2, 2) and perfect.sum() == all_val_masks.size
+assert np.allclose(iou_from_cm(perfect), 1.0) and np.allclose(dice_from_cm(perfect), 1.0)
+assert abs(pixel_accuracy(perfect) - 1.0) < 1e-12
+
+lazy = confusion_matrix(all_val_masks, np.zeros_like(all_val_masks))
+iou_lazy = iou_from_cm(lazy)
+assert abs(iou_lazy[1]) < 1e-12, 'IoU for the foreground class must be 0 when nothing is predicted'
+assert abs(pixel_accuracy(lazy) - (1 - fg)) < 1e-6
+
+absent = confusion_matrix(np.zeros((4, 4), dtype=np.int64), np.zeros((4, 4), dtype=np.int64))
+assert np.isnan(iou_from_cm(absent)[1]), 'a class absent from BOTH truth and prediction should be NaN, not 0'
+
+coarse_pred = F.interpolate(F.interpolate(torch.from_numpy(all_val_masks)[:, None].float(),
+                                          scale_factor=0.125, mode='nearest'),
+                            scale_factor=8, mode='nearest')[:, 0].numpy().astype(np.int64)
+cm_coarse = confusion_matrix(all_val_masks, coarse_pred)
+assert iou_from_cm(cm_coarse)[1] > 0.3, 'a blocky version of the truth should still score decently'
+print(f'\ncoarse (truth downsampled 8x and back): pixel acc {pixel_accuracy(cm_coarse):.4f}, '
+      f'fg IoU {iou_from_cm(cm_coarse)[1]:.4f}')
+
+print(f'\nPASS')
+print(f'  do-nothing model: pixel accuracy {pixel_accuracy(lazy):.4f}, mIoU {np.nanmean(iou_lazy):.4f}')
+print(f'  per-class IoU {np.round(iou_lazy, 4)}  <- foreground completely missed')
+print('  This is why you never report pixel accuracy for segmentation.')
+
+#%% md
+---
+## Task 3 - Dice loss
+
+Implement soft multi-class Dice loss:
+
+$$\mathcal{L} = 1 - \frac{1}{C}\sum_c \frac{2\sum_i p_{ic} g_{ic} + \epsilon}{\sum_i p_{ic} + \sum_i g_{ic} + \epsilon}$$
+
+Requirements: use **softmax probabilities** (not argmax - it has no gradient), one-hot the target
+with `F.one_hot`, sum over batch and space but **not** over classes, and cast to float32 (under AMP
+an fp16 sum over ~150k elements overflows).
+
+#%% code
+def dice_loss(logits, target, eps=1.0):
+    """logits (N,C,H,W) float, target (N,H,W) int64 -> scalar loss in [0, 1]."""
+    # TODO
+    raise NotImplementedError
+
+
+N, C, H, W = 4, 2, 16, 16
+tgt = torch.randint(0, C, (N, H, W))
+
+perfect_logits = (F.one_hot(tgt, C).permute(0, 3, 1, 2).float() - 0.5) * 60      # near one-hot
+assert dice_loss(perfect_logits, tgt).item() < 0.02, 'a near-perfect prediction should give loss ~0'
+
+worst_logits = (F.one_hot(1 - tgt, C).permute(0, 3, 1, 2).float() - 0.5) * 60    # exactly inverted
+assert dice_loss(worst_logits, tgt).item() > 0.9, 'an inverted prediction should give loss ~1'
+
+flat = torch.zeros(N, C, H, W)                                                   # uniform 50/50
+mid = dice_loss(flat, tgt).item()
+assert 0.3 < mid < 0.7, f'uniform prediction gave {mid:.3f}, expected around 0.5'
+
+g = torch.zeros(N, C, H, W, requires_grad=True)
+dice_loss(g, tgt).backward()
+assert g.grad is not None and g.grad.abs().sum() > 0, 'no gradient - did you use argmax somewhere?'
+assert dice_loss(perfect_logits.half().float(), tgt).item() < 0.05
+print(f'PASS  perfect {dice_loss(perfect_logits, tgt).item():.4f} | '
+      f'uniform {mid:.4f} | inverted {dice_loss(worst_logits, tgt).item():.4f} | gradient flows')
+
+#%% md
+---
+## Task 4 - Build the U-Net
+
+Implement `DoubleConv`, `Up` and `UNet` with **two** pooling levels (this dataset is small):
+
+- `enc1` 3 -> `base`, `enc2` `base` -> `2*base`, `bottleneck` `2*base` -> `4*base`
+- decoder mirrors it, **concatenating** the encoder features
+- final `1x1` conv to `N_CLASSES`
+- `Up` must handle a spatial mismatch between the upsampled tensor and the skip
+- output spatial size must equal input spatial size
+
+#%% code
+class DoubleConv(nn.Module):
+    """(conv3x3 -> BN -> ReLU) x2"""
+    def __init__(self, c_in, c_out):
+        super().__init__()
+        # TODO
+        raise NotImplementedError
+
+    def forward(self, x):
+        # TODO
+        raise NotImplementedError
+
+
+class Up(nn.Module):
+    """Upsample x2, concatenate the skip along channels, then DoubleConv."""
+    def __init__(self, c_in, c_skip, c_out):
+        super().__init__()
+        # TODO
+        raise NotImplementedError
+
+    def forward(self, x, skip):
+        # TODO
+        raise NotImplementedError
+
+
+class UNet(nn.Module):
+    def __init__(self, n_classes=N_CLASSES, c_in=3, base=16, use_skips=True):
+        super().__init__()
+        # TODO
+        raise NotImplementedError
+
+    def forward(self, x):
+        # TODO
+        raise NotImplementedError
+
+
+model = UNet().to(device)
+n_params = sum(p.numel() for p in model.parameters())
+with torch.no_grad():
+    out = model(torch.randn(2, 3, 96, 96, device=device))
+
+assert out.shape == (2, N_CLASSES, 96, 96), f'output {tuple(out.shape)} should be (2, 2, 96, 96)'
+assert n_params < 400_000, f'{n_params:,} parameters is more than needed'
+assert sum(1 for m in model.modules() if isinstance(m, nn.BatchNorm2d)) >= 6, 'DoubleConv needs BN'
+for s in [64, 128]:
+    with torch.no_grad():
+        assert model(torch.randn(1, 3, s, s, device=device)).shape[-2:] == (s, s), f'failed at {s}'
+with torch.no_grad():
+    odd = model(torch.randn(1, 3, 100, 100, device=device))
+assert odd.shape[-2:] == (100, 100), f'odd input 100 gave {tuple(odd.shape[-2:])} - handle the mismatch in Up'
+print(f'PASS  {n_params:,} parameters, output size always matches input')
+
+#%% md
+---
+## Task 5 - Train it
+
+Write `train_epoch` and `evaluate_seg`, then train with `CE + Dice`.
+
+`evaluate_seg` must accumulate **one confusion matrix over the whole set** and derive metrics from
+it - not average per-batch IoU (a batch with no foreground would contribute a meaningless 0/0).
+
+Target: **foreground IoU > 0.80** within 15 epochs.
+
+#%% code
+ce = nn.CrossEntropyLoss()
+
+def combined_loss(logits, target):
+    return ce(logits, target) + dice_loss(logits, target)
+
+def train_epoch(model, loader, optimizer, loss_fn, scheduler=None):
+    """-> mean loss per sample"""
+    # TODO
+    raise NotImplementedError
+
+@torch.no_grad()
+def evaluate_seg(model, loader, loss_fn):
+    """-> dict with keys 'loss', 'pixel_acc', 'iou' (per class), 'miou', 'cm'"""
+    # TODO
+    raise NotImplementedError
+
+
+EPOCHS = 15
+set_seed(0)
+model = UNet(base=16).to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+
+history = {'train_loss': [], 'val_loss': [], 'miou': [], 'fg_iou': [], 'pixel_acc': []}
+print(f'{"ep":>3} {"train":>9} {"val":>9} {"pix_acc":>8} {"mIoU":>7} {"fg IoU":>7}')
+for ep in range(EPOCHS):
+    tr = train_epoch(model, train_loader, optimizer, combined_loss, scheduler)
+    m = evaluate_seg(model, val_loader, combined_loss)
+    history['train_loss'].append(tr); history['val_loss'].append(m['loss'])
+    history['miou'].append(m['miou']); history['fg_iou'].append(float(m['iou'][1]))
+    history['pixel_acc'].append(m['pixel_acc'])
+    if ep % 3 == 0 or ep == EPOCHS - 1:
+        print(f'{ep:3d} {tr:9.4f} {m["loss"]:9.4f} {m["pixel_acc"]:8.4f} {m["miou"]:7.4f} {m["iou"][1]:7.4f}')
+
+best_fg = max(history['fg_iou'])
+assert best_fg > 0.80, f'best foreground IoU {best_fg:.4f} - below the 0.80 target'
+print(f'\nPASS  best foreground IoU {best_fg:.4f} | best mIoU {max(history["miou"]):.4f}')
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.6))
+axes[0].plot(history['train_loss'], marker='.', label='train')
+axes[0].plot(history['val_loss'], marker='.', label='val'); axes[0].set_ylabel('CE + Dice')
+axes[1].plot(history['pixel_acc'], marker='.', label='pixel acc')
+axes[1].plot(history['miou'], marker='.', label='mIoU')
+axes[1].plot(history['fg_iou'], marker='.', label='foreground IoU')
+axes[1].set_ylabel('metric')
+for ax in axes:
+    ax.set_xlabel('epoch'); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+plt.tight_layout()
+
+#%% md
+**Compare the pixel-accuracy curve with the foreground-IoU curve. What would you have concluded
+from pixel accuracy alone?** ...
+
+---
+## Task 6 - Look at the predictions
+
+Plot 5 validation samples as four rows: image, ground truth, prediction, error map. Title each
+column with its per-image foreground IoU.
+
+Then say where the errors are concentrated, and why that's expected.
+
+#%% code
+@torch.no_grad()
+def predict_mask(model, img_hwc):
+    """(H,W,3) float32 numpy -> (H,W) int64 predicted mask"""
+    # TODO
+    raise NotImplementedError
+
+
+# TODO: the 4-row x 5-column figure described above
+
+#%% md
+**Where are the errors, and why?** ...
+
+---
+## Task 7 - Ablate the skip connections
+
+Train two models for 10 epochs: `use_skips=True` and `use_skips=False`, same seed, same
+hyperparameters. Report both foreground IoU curves and plot one prediction from each.
+
+*Hint: implement `use_skips=False` by replacing the skip tensors with `torch.zeros_like(...)`, so
+the parameter count stays identical and the comparison is fair.*
+
+#%% code
+def train_variant(use_skips, epochs=10):
+    """-> (model, list of foreground IoU per epoch)"""
+    # TODO
+    raise NotImplementedError
+
+
+m_skip, iou_skip = train_variant(True)
+m_noskip, iou_noskip = train_variant(False)
+
+assert sum(p.numel() for p in m_skip.parameters()) == sum(p.numel() for p in m_noskip.parameters()), \
+    'the two variants must have identical parameter counts for this to be a fair test'
+print(f'with skips    final fg IoU {iou_skip[-1]:.4f}')
+print(f'without skips final fg IoU {iou_noskip[-1]:.4f}')
+assert iou_skip[-1] > iou_noskip[-1], 'skips should help - check your concatenation'
+print(f'PASS  skips are worth {iou_skip[-1] - iou_noskip[-1]:+.4f} foreground IoU')
+
+# TODO: plot the two IoU curves, and one image's prediction from each model side by side
+
+#%% md
+---
+## Task 8 - Class weighting
+
+The dataset is ~90% background. Train with `nn.CrossEntropyLoss(weight=...)` where the weight for
+each class is inversely proportional to its pixel frequency **in the training set**, normalized so
+the weights average 1.
+
+Compare against unweighted CE (no Dice, so the effect is visible). Report foreground IoU for both,
+and comment on whether it helped.
+
+#%% code
+def class_weights_from_masks(masks, k=N_CLASSES):
+    """-> (k,) float32 tensor of inverse-frequency weights, mean 1."""
+    # TODO
+    raise NotImplementedError
+
+
+train_masks = np.stack([m for _, m in train_ds_raw.items])
+w = class_weights_from_masks(train_masks)
+freq = np.bincount(train_masks.ravel(), minlength=N_CLASSES) / train_masks.size
+
+assert w.shape == (N_CLASSES,) and w.dtype == torch.float32
+assert abs(float(w.mean()) - 1.0) < 1e-5, f'weights should average 1, got {float(w.mean()):.4f}'
+assert w[1] > w[0], 'the rare class should get the larger weight'
+print(f'class frequencies {np.round(freq, 4)} -> weights {np.round(w.numpy(), 4)}')
+
+# TODO: train 10 epochs with plain CE and 10 with weighted CE; store best fg IoU in
+#       fg_plain and fg_weighted
+raise NotImplementedError
+
+print(f'plain CE    best fg IoU {fg_plain:.4f}')
+print(f'weighted CE best fg IoU {fg_weighted:.4f}')
+print(f'difference  {fg_weighted - fg_plain:+.4f}')
+
+#%% md
+**Did weighting help? Why or why not, on this dataset?** ...
+
+---
+## Done - and that's the course
+
+- [ ] I know the shapes and dtypes segmentation losses need.
+- [ ] I never report pixel accuracy for segmentation.
+- [ ] I know masks resize with nearest neighbour, and augment paired with the image.
+- [ ] I can build an encoder-decoder with skip connections from scratch.
+
+Solutions: [`solutions/sol06_segmentation.ipynb`](solutions/sol06_segmentation.ipynb)
+
+Then see the end of [`docs/06_segmentation.md`](../docs/06_segmentation.md) for where to go next.
