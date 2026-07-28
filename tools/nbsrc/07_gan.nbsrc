@@ -1,0 +1,633 @@
+#out notebooks/07_gan_dcgan.ipynb
+#gpu on
+
+#%% md
+# Chapter 7 - GANs: learning to generate
+
+Companion to [`docs/07_gans.md`](../docs/07_gans.md).
+
+> **GPU: Runtime -> Change runtime type -> T4 GPU.** About 10 minutes total.
+
+First model in this course whose output is an **image**, not a label. Dataset: MNIST at 32x32 -
+small enough to train a GAN properly in minutes, and legible enough that you can *see* mode
+collapse when it happens.
+
+The plan:
+
+1. Show why a pixel-wise loss **cannot** work for generation (a 30-second demo that produces the
+   world's blurriest digit).
+2. Build a DCGAN, and check the pieces before training anything.
+3. Train it, watching the diagnostics that actually mean something (**not** the loss).
+4. Walk the latent space.
+5. Measure FID, and measure diversity to detect mode collapse.
+6. Make it **conditional** so we can ask for a specific digit.
+
+#%% code
+import sys, time, math
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+import torchvision
+from torchvision import datasets, transforms
+from torchvision.utils import make_grid
+
+print('torch', torch.__version__, '| torchvision', torchvision.__version__)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+if device.type != 'cuda':
+    print('\n*** NO GPU: Runtime -> Change runtime type -> T4 GPU, then Restart. ***')
+    print('On CPU, reduce EPOCHS to 1-2 and expect poor samples.')
+print('device', device)
+
+try:
+    import google.colab  # noqa: F401
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+DATA_DIR = '/content/data' if IN_COLAB else './data'
+NUM_WORKERS = 2 if IN_COLAB else 0
+
+def set_seed(seed=0):
+    import random
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+set_seed(0)
+torch.backends.cudnn.benchmark = True
+plt.rcParams['figure.dpi'] = 110
+
+#%% md
+## 1. Data, normalized to [-1, 1]
+
+The generator will end in `tanh`, whose range is $[-1, 1]$. **The data must live in the same range**
+or the generator physically cannot reach it. `Normalize((0.5,), (0.5,))` maps $[0,1] \to [-1,1]$.
+
+#%% code
+IMG_SIZE = 32
+Z_DIM = 100
+BATCH = 128
+
+tf = transforms.Compose([
+    transforms.Resize(IMG_SIZE),
+    transforms.ToTensor(),                       # [0, 1]
+    transforms.Normalize((0.5,), (0.5,)),        # -> [-1, 1] to match tanh
+])
+
+train_ds = datasets.MNIST(DATA_DIR, train=True, download=True, transform=tf)
+loader = DataLoader(train_ds, batch_size=BATCH, shuffle=True, num_workers=NUM_WORKERS,
+                    pin_memory=device.type == 'cuda', drop_last=True)
+
+print(f'{len(train_ds)} images, {len(loader)} batches of {BATCH}')
+xb, yb = next(iter(loader))
+print(f'batch {tuple(xb.shape)} | range ({xb.min():.2f}, {xb.max():.2f}) | labels {yb[:8].tolist()}')
+assert xb.min() >= -1.01 and xb.max() <= 1.01
+
+def to_img(t):
+    """[-1,1] tensor -> [0,1] numpy for display."""
+    return ((t.detach().cpu() + 1) / 2).clamp(0, 1)
+
+def show_grid(t, nrow=8, title='', figsize=(8, 8)):
+    g = make_grid(to_img(t), nrow=nrow, padding=2)
+    plt.figure(figsize=figsize)
+    plt.imshow(g.permute(1, 2, 0).numpy(), cmap='gray')
+    plt.axis('off'); plt.title(title)
+    plt.show()
+
+show_grid(xb[:64], title='real MNIST, 32x32, normalized to [-1,1]', figsize=(6, 6))
+
+#%% md
+## 2. Why not just use MSE?
+
+Suppose we skip the adversary and train a network $z \to x$ with MSE against real images. Each $z$
+gets a random real target, so the loss-minimising output is the **conditional mean** - the average of
+all digits. Let's watch that happen. It takes 20 seconds and it explains the entire existence of
+adversarial training.
+
+#%% code
+set_seed(0)
+naive = nn.Sequential(
+    nn.Linear(Z_DIM, 256), nn.ReLU(),
+    nn.Linear(256, 512), nn.ReLU(),
+    nn.Linear(512, IMG_SIZE * IMG_SIZE), nn.Tanh(),
+).to(device)
+opt_naive = torch.optim.Adam(naive.parameters(), lr=1e-3)
+
+for step, (real, _) in enumerate(loader):
+    if step >= 300:
+        break
+    real = real.to(device).view(real.size(0), -1)
+    z = torch.randn(real.size(0), Z_DIM, device=device)
+    loss = F.mse_loss(naive(z), real)              # random z -> random real image
+    opt_naive.zero_grad(set_to_none=True); loss.backward(); opt_naive.step()
+
+with torch.no_grad():
+    out = naive(torch.randn(8, Z_DIM, device=device)).view(-1, 1, IMG_SIZE, IMG_SIZE)
+    dataset_mean = torch.stack([train_ds[i][0] for i in range(2000)]).mean(0, keepdim=True)
+
+print(f'final MSE {loss.item():.4f}')
+print(f'distance from the dataset mean image: {F.mse_loss(out.cpu().mean(0), dataset_mean[0]).item():.5f}')
+
+fig, axes = plt.subplots(1, 9, figsize=(13, 1.9))
+for i in range(8):
+    axes[i].imshow(to_img(out[i])[0].numpy(), cmap='gray'); axes[i].set_title(f'z_{i}', fontsize=8)
+axes[8].imshow(to_img(dataset_mean)[0, 0].numpy(), cmap='gray'); axes[8].set_title('dataset mean', fontsize=8)
+for ax in axes: ax.axis('off')
+plt.suptitle('MSE generator: eight different z, eight identical blurs - and the dataset mean for comparison')
+plt.tight_layout()
+
+print('\nEvery z gives the same blurry average, because that IS the MSE optimum when the target')
+print('is random. A pixel-wise loss cannot express "looks like a plausible digit" - only')
+print('"close to this specific digit". Averaging many valid answers gives an invalid one.')
+print('\nThe GAN fix: do not specify the target. LEARN the loss, as a second network.')
+
+#%% md
+## 3. The DCGAN
+
+Generator: `(N, 100, 1, 1)` noise -> `(N, 1, 32, 32)` image, by transposed convolution.
+Discriminator: a normal CNN classifier ending in **one logit** (no sigmoid).
+
+#%% code
+class Generator(nn.Module):
+    def __init__(self, z_dim=Z_DIM, c_out=1, base=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            # (N, z, 1, 1) -> (N, 4b, 4, 4): kernel 4, stride 1, no padding
+            nn.ConvTranspose2d(z_dim, 4 * base, 4, 1, 0, bias=False),
+            nn.BatchNorm2d(4 * base), nn.ReLU(True),
+            nn.ConvTranspose2d(4 * base, 2 * base, 4, 2, 1, bias=False),      # -> 8x8
+            nn.BatchNorm2d(2 * base), nn.ReLU(True),
+            nn.ConvTranspose2d(2 * base, base, 4, 2, 1, bias=False),          # -> 16x16
+            nn.BatchNorm2d(base), nn.ReLU(True),
+            nn.ConvTranspose2d(base, c_out, 4, 2, 1, bias=False),             # -> 32x32
+            nn.Tanh(),                                                        # match the data range
+        )
+
+    def forward(self, z):
+        return self.net(z.view(z.size(0), -1, 1, 1))
+
+
+class Discriminator(nn.Module):
+    def __init__(self, c_in=1, base=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(c_in, base, 4, 2, 1, bias=False),                       # 32 -> 16
+            nn.LeakyReLU(0.2, True),                                          # NO BatchNorm here
+            nn.Conv2d(base, 2 * base, 4, 2, 1, bias=False),                   # -> 8
+            nn.BatchNorm2d(2 * base), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(2 * base, 4 * base, 4, 2, 1, bias=False),               # -> 4
+            nn.BatchNorm2d(4 * base), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(4 * base, 1, 4, 1, 0, bias=False),                      # -> 1x1 logit
+        )
+
+    def forward(self, x):
+        return self.net(x).view(-1, 1)                                        # (N, 1) LOGITS
+
+
+def dcgan_init(m):
+    """The DCGAN paper's initialization: N(0, 0.02). Genuinely matters for GAN stability."""
+    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+        nn.init.normal_(m.weight, 0.0, 0.02)
+    elif isinstance(m, nn.BatchNorm2d):
+        nn.init.normal_(m.weight, 1.0, 0.02)
+        nn.init.zeros_(m.bias)
+
+
+set_seed(0)
+G = Generator().to(device); G.apply(dcgan_init)
+D = Discriminator().to(device); D.apply(dcgan_init)
+
+print(f'G parameters: {sum(p.numel() for p in G.parameters()):,}')
+print(f'D parameters: {sum(p.numel() for p in D.parameters()):,}')
+
+z = torch.randn(4, Z_DIM, device=device)
+with torch.no_grad():
+    fake = G(z)
+    logits = D(fake)
+print(f'\nG: z {tuple(z.shape)} -> image {tuple(fake.shape)}')
+print(f'   output range ({fake.min():.3f}, {fake.max():.3f}) - tanh, so within [-1, 1]')
+print(f'D: image {tuple(fake.shape)} -> logits {tuple(logits.shape)}')
+
+print('\nG shape trace:')
+h = z.view(4, -1, 1, 1)
+for i, layer in enumerate(G.net):
+    h = layer(h)
+    if isinstance(layer, (nn.ConvTranspose2d, nn.Tanh)):
+        print(f'  after {type(layer).__name__:16} {tuple(h.shape)}')
+
+#%% md
+### Sanity check: the initial losses
+
+At initialization $D$ should be at chance, so $D(x) \approx 0$ logits and:
+
+- `d_loss = bce(real, 1) + bce(fake, 0)` should be about $2\ln 2 = 1.386$
+- `g_loss = bce(fake, 1)` should be about $\ln 2 = 0.693$
+
+#%% code
+bce = nn.BCEWithLogitsLoss()
+real = xb.to(device)
+n = real.size(0)
+ones = torch.ones(n, 1, device=device)
+zeros = torch.zeros(n, 1, device=device)
+
+with torch.no_grad():
+    fake = G(torch.randn(n, Z_DIM, device=device))
+    d_loss0 = bce(D(real), ones) + bce(D(fake), zeros)
+    g_loss0 = bce(D(fake), ones)
+
+print(f'2*ln(2) = {2 * math.log(2):.4f} | measured d_loss {d_loss0.item():.4f}')
+print(f'  ln(2) = {math.log(2):.4f} | measured g_loss {g_loss0.item():.4f}')
+print('\nA balanced GAN stays near these values FOREVER. That is not a lack of progress -')
+print('it is what equilibrium looks like when both losses are defined relative to each other.')
+
+print('\nthe .detach() trap, made concrete:')
+G.zero_grad(set_to_none=True)
+fake = G(torch.randn(8, Z_DIM, device=device))
+bce(D(fake), torch.zeros(8, 1, device=device)).backward()          # NO detach
+g_grad = sum(p.grad.abs().sum().item() for p in G.parameters() if p.grad is not None)
+print(f'  without detach, G accumulated gradient magnitude {g_grad:.2f}  <- D is teaching G the WRONG objective')
+G.zero_grad(set_to_none=True)
+fake = G(torch.randn(8, Z_DIM, device=device))
+bce(D(fake.detach()), torch.zeros(8, 1, device=device)).backward()  # detached
+g_grad = sum(p.grad.abs().sum().item() for p in G.parameters() if p.grad is not None)
+print(f'  with detach,    G accumulated gradient magnitude {g_grad:.2f}  <- correct: G untouched by D step')
+G.zero_grad(set_to_none=True); D.zero_grad(set_to_none=True)
+
+#%% md
+## 4. Train
+
+One step of $D$, then one step of $G$, per batch. We track the numbers that actually mean something:
+**$D$'s accuracy on real and on fake**. Near 0.5-0.7 is healthy. Pinned at 1.0 means $D$ has won and
+$G$ is starving.
+
+Note the **one-sided label smoothing** (`real_label = 0.9`): it stops $D$ becoming overconfident,
+which is the most common cause of a starved generator.
+
+#%% code
+EPOCHS = 6
+LR = 2e-4
+REAL_LABEL = 0.9        # one-sided label smoothing
+
+set_seed(0)
+G = Generator().to(device); G.apply(dcgan_init)
+D = Discriminator().to(device); D.apply(dcgan_init)
+opt_G = torch.optim.Adam(G.parameters(), lr=LR, betas=(0.5, 0.999))
+opt_D = torch.optim.Adam(D.parameters(), lr=LR, betas=(0.5, 0.999))
+
+fixed_z = torch.randn(64, Z_DIM, device=device)      # same noise every epoch -> watch it evolve
+snapshots = []
+hist = {'d_loss': [], 'g_loss': [], 'acc_real': [], 'acc_fake': []}
+
+print(f'{EPOCHS} epochs, Adam lr={LR} betas=(0.5, 0.999), label smoothing {REAL_LABEL}')
+print(f'{"ep":>3} {"d_loss":>8} {"g_loss":>8} {"D(real)>0":>10} {"D(fake)>0":>10} {"time":>7}')
+
+for epoch in range(EPOCHS):
+    t0 = time.perf_counter()
+    ep = {k: 0.0 for k in hist}
+    nb = 0
+    for real, _ in loader:
+        real = real.to(device, non_blocking=True)
+        n = real.size(0)
+        ones = torch.full((n, 1), REAL_LABEL, device=device)
+        zeros = torch.zeros(n, 1, device=device)
+
+        # ---------------- discriminator: real -> 1, fake -> 0
+        z = torch.randn(n, Z_DIM, device=device)
+        fake = G(z)
+        opt_D.zero_grad(set_to_none=True)
+        out_real = D(real)
+        out_fake = D(fake.detach())                  # detach: do not backprop into G here
+        d_loss = bce(out_real, ones) + bce(out_fake, zeros)
+        d_loss.backward()
+        opt_D.step()
+
+        # ---------------- generator: make D call the fakes real
+        opt_G.zero_grad(set_to_none=True)
+        g_loss = bce(D(fake), torch.ones(n, 1, device=device))   # non-saturating form
+        g_loss.backward()
+        opt_G.step()
+
+        ep['d_loss'] += d_loss.item(); ep['g_loss'] += g_loss.item()
+        ep['acc_real'] += (out_real > 0).float().mean().item()
+        ep['acc_fake'] += (out_fake > 0).float().mean().item()
+        nb += 1
+
+    for k in hist:
+        hist[k].append(ep[k] / nb)
+    G.eval()
+    with torch.no_grad():
+        snapshots.append(G(fixed_z).cpu())
+    G.train()
+    print(f'{epoch:3d} {hist["d_loss"][-1]:8.4f} {hist["g_loss"][-1]:8.4f} '
+          f'{hist["acc_real"][-1]:10.3f} {hist["acc_fake"][-1]:10.3f} {time.perf_counter() - t0:6.1f}s')
+
+print('\nD(real)>0 is how often D correctly calls a real image real.')
+print('D(fake)>0 is how often D is FOOLED. Healthy training keeps both away from 0 and 1.')
+
+#%% code
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.6))
+axes[0].plot(hist['d_loss'], marker='o', label='D loss')
+axes[0].plot(hist['g_loss'], marker='s', label='G loss')
+axes[0].axhline(2 * math.log(2), ls=':', c='k', label='2ln2 (equilibrium)')
+axes[0].set_xlabel('epoch'); axes[0].set_ylabel('loss'); axes[0].legend(fontsize=8)
+axes[0].set_title('losses - almost uninformative, by design')
+axes[1].plot(hist['acc_real'], marker='o', label='D correct on real')
+axes[1].plot(hist['acc_fake'], marker='s', label='D fooled by fake')
+axes[1].axhline(0.5, ls=':', c='k')
+axes[1].set_xlabel('epoch'); axes[1].set_ylabel('rate'); axes[1].legend(fontsize=8)
+axes[1].set_title('the diagnostic that matters')
+for ax in axes: ax.grid(alpha=0.3)
+plt.tight_layout()
+
+print('If D loss had collapsed toward 0 while G loss climbed, D would have won and G would be')
+print('starved of gradient. The fix is to WEAKEN D: lower its LR, smooth its labels, shrink it.')
+print('Counter-intuitive but correct - a discriminator that is too good is useless as a teacher.')
+
+#%% code
+n_snap = len(snapshots)
+fig, axes = plt.subplots(1, n_snap, figsize=(2.3 * n_snap, 2.6))
+for ax, (i, s) in zip(np.atleast_1d(axes), enumerate(snapshots)):
+    g = make_grid(to_img(s[:16]), nrow=4, padding=1)
+    ax.imshow(g.permute(1, 2, 0).numpy(), cmap='gray')
+    ax.set_title(f'epoch {i}', fontsize=9); ax.axis('off')
+plt.suptitle('the SAME 16 latent vectors, after each epoch')
+plt.tight_layout()
+
+G.eval()
+with torch.no_grad():
+    samples = G(torch.randn(64, Z_DIM, device=device))
+show_grid(samples, nrow=8, title=f'64 samples after {EPOCHS} epochs', figsize=(7, 7))
+print('Because the noise is fixed, you are watching individual samples SHARPEN rather than')
+print('a fresh random draw each time. That makes real progress visible.')
+
+#%% md
+## 5. Walking the latent space
+
+Interpolate between two noise vectors. If $G$ learned structure, the morph is smooth and every
+intermediate frame is a plausible digit. If it memorised, you get a crossfade of two images.
+
+#%% code
+@torch.no_grad()
+def interpolate(G, z_a, z_b, steps=10, spherical=True):
+    """Linear or spherical interpolation between two latent vectors."""
+    ts = torch.linspace(0, 1, steps, device=z_a.device).view(-1, 1)
+    if spherical:
+        a = z_a / z_a.norm(); b = z_b / z_b.norm()
+        omega = torch.acos((a * b).sum().clamp(-1, 1))
+        so = torch.sin(omega)
+        zs = (torch.sin((1 - ts) * omega) / so) * z_a + (torch.sin(ts * omega) / so) * z_b
+    else:
+        zs = (1 - ts) * z_a + ts * z_b
+    return G(zs)
+
+set_seed(3)
+fig, axes = plt.subplots(4, 10, figsize=(13, 5.4))
+for row in range(4):
+    za, zb = torch.randn(1, Z_DIM, device=device), torch.randn(1, Z_DIM, device=device)
+    imgs = interpolate(G, za[0], zb[0], steps=10)
+    for col in range(10):
+        axes[row, col].imshow(to_img(imgs[col])[0].numpy(), cmap='gray'); axes[row, col].axis('off')
+plt.suptitle('spherical interpolation in latent space (left z -> right z)')
+plt.tight_layout()
+
+print('Why SPHERICAL and not linear: z ~ N(0, I) in 100 dimensions concentrates on a sphere of')
+print(f'radius about sqrt(100) = {math.sqrt(Z_DIM):.0f}. The linear midpoint of two such vectors has norm')
+print('around 0.7x that, so it lies in a region the generator never saw during training and')
+print('the middle frames come out washed out. Slerp stays on the sphere. Try spherical=False.')
+
+#%% md
+## 6. Diagnosing mode collapse
+
+Mode collapse = high fidelity, zero diversity. It will not show up in the loss. Measure it
+directly: the mean pairwise distance between samples, and the per-pixel standard deviation across a
+batch. Compare against real data as the reference.
+
+#%% code
+@torch.no_grad()
+def diversity(batch):
+    """Mean pairwise L2 distance between flattened samples, and mean per-pixel std."""
+    flat = batch.view(batch.size(0), -1)
+    d = torch.cdist(flat, flat)
+    n = flat.size(0)
+    mean_pairwise = d.sum() / (n * (n - 1))            # exclude the zero diagonal
+    return mean_pairwise.item(), batch.std(dim=0).mean().item()
+
+real_batch = next(iter(loader))[0].to(device)
+G.eval()
+with torch.no_grad():
+    fake_batch = G(torch.randn(real_batch.size(0), Z_DIM, device=device))
+
+dr, sr = diversity(real_batch)
+df, sf = diversity(fake_batch)
+collapsed = fake_batch[:1].repeat(real_batch.size(0), 1, 1, 1)      # a perfectly collapsed generator
+dc, sc = diversity(collapsed)
+
+print(f'{"":22} {"pairwise dist":>14} {"per-pixel std":>14}')
+print(f'{"real data":22} {dr:14.3f} {sr:14.4f}')
+print(f'{"our generator":22} {df:14.3f} {sf:14.4f}')
+print(f'{"fully collapsed":22} {dc:14.3f} {sc:14.4f}   <- what failure looks like')
+print(f'\ndiversity ratio (fake/real): {df / dr:.3f}')
+if df / dr > 0.7:
+    print('-> healthy. Samples are about as varied as the real data.')
+else:
+    print('-> suspicious. Look at the sample grid: are many samples near-identical?')
+
+print('\nAlso worth checking: which digits did it actually learn? Mode collapse is often PARTIAL -')
+print('the generator covers 6 of 10 digits and silently drops the rest. Loss will not tell you.')
+
+#%% md
+## 7. FID: a number for sample quality
+
+Push real and generated images through a pretrained Inception network, fit a Gaussian to the 2048-d
+features of each, and measure the Frechet distance between the two Gaussians.
+
+$$\text{FID} = \|\mu_r - \mu_g\|^2 + \text{Tr}\big(\Sigma_r + \Sigma_g - 2(\Sigma_r\Sigma_g)^{1/2}\big)$$
+
+#%% code
+from scipy import linalg
+
+@torch.no_grad()
+def inception_features(images, model, batch=100, size=160):
+    """images: (N,1,H,W) in [-1,1] -> (N, 2048) features."""
+    feats = []
+    for i in range(0, images.size(0), batch):
+        x = to_img(images[i:i + batch]).to(device)                # -> [0,1] on the GPU
+        x = x.repeat(1, 3, 1, 1)                                  # gray -> 3 channels
+        x = F.interpolate(x, size=(size, size), mode='bilinear', align_corners=False)
+        x = (x - torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)) / \
+            torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+        feats.append(model(x).cpu())
+    return torch.cat(feats).numpy()
+
+
+def frechet_distance(f_real, f_fake, eps=1e-6):
+    mu_r, mu_f = f_real.mean(0), f_fake.mean(0)
+    sig_r = np.cov(f_real, rowvar=False)
+    sig_f = np.cov(f_fake, rowvar=False)
+    diff = mu_r - mu_f
+    covmean, _ = linalg.sqrtm(sig_r.dot(sig_f), disp=False)
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real                                    # tiny imaginary parts are numerical
+    return float(diff.dot(diff) + np.trace(sig_r) + np.trace(sig_f) - 2 * np.trace(covmean))
+
+
+N_FID = 2000
+print(f'loading Inception-v3 and computing FID on {N_FID} real vs {N_FID} generated images...')
+print('(most of the wait is scipy.linalg.sqrtm on the 2048x2048 covariance, three times)')
+t0 = time.perf_counter()
+inc = torchvision.models.inception_v3(weights=torchvision.models.Inception_V3_Weights.DEFAULT,
+                                     transform_input=False).to(device).eval()
+inc.fc = nn.Identity()                                            # 2048-d pool features
+
+real_imgs = torch.stack([train_ds[i][0] for i in range(N_FID)])
+G.eval()
+with torch.no_grad():
+    fake_imgs = torch.cat([G(torch.randn(100, Z_DIM, device=device)).cpu() for _ in range(N_FID // 100)])
+
+f_real = inception_features(real_imgs, inc)
+f_fake = inception_features(fake_imgs, inc)
+fid_ours = frechet_distance(f_real, f_fake)
+
+f_real_b = inception_features(torch.stack([train_ds[i][0] for i in range(N_FID, 2 * N_FID)]), inc)
+fid_floor = frechet_distance(f_real, f_real_b)
+fid_noise = frechet_distance(f_real, inception_features(torch.rand(N_FID, 1, 32, 32) * 2 - 1, inc))
+
+print(f'done in {time.perf_counter() - t0:.0f}s\n')
+print(f'FID, real vs real (the floor)   {fid_floor:8.2f}   <- not 0, because {N_FID} samples is few')
+print(f'FID, real vs our generator      {fid_ours:8.2f}')
+print(f'FID, real vs uniform noise      {fid_noise:8.2f}   <- the ceiling for reference')
+print('\nAlways compute that real-vs-real floor. It tells you how much of your FID is sample')
+print('noise rather than model error, and it is the single most common omission in GAN reports.')
+print('\nCaveats: FID needs >=10k samples to be stable, and Inception features are trained on')
+print('natural colour photos - on grayscale digits they are a poor basis. Treat this as a')
+print('RELATIVE signal within this notebook only. Never compare it to a number from a paper.')
+
+#%% md
+## 8. Conditional GAN: choose the digit
+
+Unconditional $G(z)$ gives you *a* digit. Feed the label to **both** networks and you can ask for a
+specific one. $D$ must see the label too, or nothing penalises $G$ for ignoring it.
+
+#%% code
+N_CLASSES = 10
+EMB = 32
+
+class CondGenerator(nn.Module):
+    def __init__(self, z_dim=Z_DIM, base=64):
+        super().__init__()
+        self.emb = nn.Embedding(N_CLASSES, EMB)
+        self.net = nn.Sequential(
+            nn.ConvTranspose2d(z_dim + EMB, 4 * base, 4, 1, 0, bias=False),
+            nn.BatchNorm2d(4 * base), nn.ReLU(True),
+            nn.ConvTranspose2d(4 * base, 2 * base, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(2 * base), nn.ReLU(True),
+            nn.ConvTranspose2d(2 * base, base, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(base), nn.ReLU(True),
+            nn.ConvTranspose2d(base, 1, 4, 2, 1, bias=False),
+            nn.Tanh(),
+        )
+
+    def forward(self, z, y):
+        h = torch.cat([z, self.emb(y)], dim=1)          # concatenate label embedding to the noise
+        return self.net(h.view(h.size(0), -1, 1, 1))
+
+
+class CondDiscriminator(nn.Module):
+    def __init__(self, base=64):
+        super().__init__()
+        self.emb = nn.Embedding(N_CLASSES, IMG_SIZE * IMG_SIZE)     # label -> an extra image channel
+        self.net = nn.Sequential(
+            nn.Conv2d(2, base, 4, 2, 1, bias=False), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(base, 2 * base, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(2 * base), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(2 * base, 4 * base, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(4 * base), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(4 * base, 1, 4, 1, 0, bias=False),
+        )
+
+    def forward(self, x, y):
+        y_map = self.emb(y).view(-1, 1, IMG_SIZE, IMG_SIZE)
+        return self.net(torch.cat([x, y_map], dim=1)).view(-1, 1)
+
+
+set_seed(0)
+cG = CondGenerator().to(device); cG.apply(dcgan_init)
+cD = CondDiscriminator().to(device); cD.apply(dcgan_init)
+opt_cG = torch.optim.Adam(cG.parameters(), lr=LR, betas=(0.5, 0.999))
+opt_cD = torch.optim.Adam(cD.parameters(), lr=LR, betas=(0.5, 0.999))
+
+print(f'cG {sum(p.numel() for p in cG.parameters()):,} params | cD {sum(p.numel() for p in cD.parameters()):,} params')
+print(f'\ntraining the conditional GAN for {EPOCHS} epochs:')
+print(f'{"ep":>3} {"d_loss":>8} {"g_loss":>8} {"D fooled":>9} {"time":>7}')
+
+for epoch in range(EPOCHS):
+    t0 = time.perf_counter()
+    dl = gl = fooled = 0.0
+    nb = 0
+    for real, y in loader:
+        real, y = real.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        n = real.size(0)
+        ones = torch.full((n, 1), REAL_LABEL, device=device)
+        zeros = torch.zeros(n, 1, device=device)
+
+        y_fake = torch.randint(0, N_CLASSES, (n,), device=device)
+        fake = cG(torch.randn(n, Z_DIM, device=device), y_fake)
+
+        opt_cD.zero_grad(set_to_none=True)
+        out_fake = cD(fake.detach(), y_fake)
+        d_loss = bce(cD(real, y), ones) + bce(out_fake, zeros)
+        d_loss.backward(); opt_cD.step()
+
+        opt_cG.zero_grad(set_to_none=True)
+        g_loss = bce(cD(fake, y_fake), torch.ones(n, 1, device=device))
+        g_loss.backward(); opt_cG.step()
+
+        dl += d_loss.item(); gl += g_loss.item()
+        fooled += (out_fake > 0).float().mean().item(); nb += 1
+    print(f'{epoch:3d} {dl / nb:8.4f} {gl / nb:8.4f} {fooled / nb:9.3f} {time.perf_counter() - t0:6.1f}s')
+
+#%% code
+cG.eval()
+with torch.no_grad():
+    ys = torch.arange(N_CLASSES, device=device).repeat_interleave(10)
+    zs = torch.randn(10, Z_DIM, device=device).repeat(N_CLASSES, 1)     # same 10 z for every row
+    grid = cG(zs, ys)
+
+g = make_grid(to_img(grid), nrow=10, padding=2)
+plt.figure(figsize=(8, 8))
+plt.imshow(g.permute(1, 2, 0).numpy(), cmap='gray')
+plt.axis('off')
+plt.title('conditional GAN: one row per requested digit 0-9\n(columns share the same z)')
+plt.show()
+
+print('Rows are the class we ASKED for. Columns share a latent vector, so you can see what z')
+print('encodes independently of the label - stroke weight, slant, width.')
+print('\nThat factorization (label = what, z = how) is the same idea as classifier-free guidance')
+print('in chapter 8, and the same idea as a text prompt in a modern text-to-image model.')
+
+#%% md
+## What to remember
+
+| Idea | The one-liner |
+|---|---|
+| Why adversarial | you cannot write a loss for "looks real", so you **learn** one |
+| Why not MSE | averaging many valid outputs gives an invalid one (blur) |
+| G loss | `bce(D(fake), ones)` - the non-saturating form |
+| D loss | `bce(D(real), ones) + bce(D(fake.detach()), zeros)` |
+| `.detach()` | omit it and the D step trains G with D's objective; nothing errors |
+| Output range | `tanh` generator **requires** data normalized to [-1, 1] |
+| DCGAN recipe | 4x4 stride-2 convs, BN, LeakyReLU(0.2) in D, no BN on D's first layer, `Adam(2e-4, betas=(0.5,0.999))`, init `N(0, 0.02)` |
+| Equilibrium | `d_loss ~ 2ln2`, D accuracy ~0.5. **Loss is not a progress signal** |
+| Real diagnostics | D's accuracy on real/fake, a fixed-noise sample grid, a diversity measure |
+| Mode collapse | high fidelity, no diversity - measure pairwise distance vs real data |
+| D too strong | the most common failure. **Weaken** D: label smoothing, lower LR, spectral norm |
+| FID | Frechet distance between Inception features. Always report the real-vs-real floor |
+| Slerp | interpolate on the sphere; the linear midpoint of two Gaussians is off-distribution |
+| Conditional | condition **both** players, or G ignores the label |
+
+Now do [`exercises/ex07_gan.ipynb`](../exercises/ex07_gan.ipynb).
+
+Chapter 8 generates images too - but by a completely different route, with a loss so simple
+(plain MSE on noise) that none of this instability exists. And it reuses the U-Net you built in
+chapter 6.

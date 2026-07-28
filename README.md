@@ -1,10 +1,10 @@
-# CV Bootcamp — from NumPy to Segmentation
+# CV Bootcamp — from NumPy to Diffusion
 
 A self-paced refresher course in classical + deep-learning computer vision, taught in
-PyTorch. Six chapters, each with a **written lesson**, a **worked notebook**, and a
+PyTorch. Eight chapters, each with a **written lesson**, a **worked notebook**, and a
 **graded exercise notebook** (solutions included).
 
-Designed for a machine **without a GPU**: chapters 1–3 run fine on a CPU, chapters 4–6
+Designed for a machine **without a GPU**: chapters 1–3 run fine on a CPU, chapters 4–8
 expect a free Google Colab T4. See [docs/00_setup_colab_vscode.md](docs/00_setup_colab_vscode.md)
 for the VS Code ↔ Colab workflow.
 
@@ -20,6 +20,13 @@ for the VS Code ↔ Colab workflow.
 | 4 | CNN image classification (CIFAR-10), full training loop | [docs](docs/04_cnn_classification.md) | [nb](notebooks/04_cnn_classification.ipynb) | [ex](exercises/ex04_cnn.ipynb) · [sol](exercises/solutions/sol04_cnn.ipynb) | yes |
 | 5 | Transfer learning & fine-tuning a pretrained ResNet | [docs](docs/05_transfer_learning.md) | [nb](notebooks/05_transfer_learning.ipynb) | [ex](exercises/ex05_transfer.ipynb) · [sol](exercises/solutions/sol05_transfer.ipynb) | yes |
 | 6 | Semantic segmentation with a U-Net | [docs](docs/06_segmentation.md) | [nb](notebooks/06_segmentation_unet.ipynb) | [ex](exercises/ex06_segmentation.ipynb) · [sol](exercises/solutions/sol06_segmentation.ipynb) | yes |
+| 7 | GANs: adversarial generation, DCGAN, conditional GAN | [docs](docs/07_gans.md) | [nb](notebooks/07_gan_dcgan.ipynb) | [ex](exercises/ex07_gan.ipynb) · [sol](exercises/solutions/sol07_gan.ipynb) | yes |
+| 8 | Diffusion: DDPM from scratch, DDIM, guidance | [docs](docs/08_diffusion.md) | [nb](notebooks/08_diffusion_ddpm.ipynb) | [ex](exercises/ex08_diffusion.ipynb) · [sol](exercises/solutions/sol08_diffusion.ipynb) | yes |
+
+Chapters 1–6 build a *discriminative* pipeline (image → label / mask). Chapters 7–8 turn it
+around: **generative** modelling, where there is no ground-truth output and defining the
+objective is the whole problem. Chapter 8 reuses the U-Net from chapter 6 directly — the
+architecture you wrote for segmentation is the denoising backbone of a diffusion model.
 
 Reference material you will come back to:
 
@@ -36,13 +43,14 @@ Reference material you will come back to:
 4. **Compare** with `exercises/solutions/`. The solutions explain *why*, not just *what*.
 
 Budget roughly 2–4 hours per chapter. Chapters build on each other; chapter 6 assumes
-you are comfortable with the training loop from chapter 4.
+you are comfortable with the training loop from chapter 4, and chapter 8 assumes chapter 6's
+U-Net and chapter 7's conditioning trick.
 
 ## Quick start (Colab, recommended)
 
 1. Push this folder to a GitHub repo (see [docs/00_setup_colab_vscode.md](docs/00_setup_colab_vscode.md)).
 2. Open <https://colab.research.google.com> → **GitHub** tab → pick a notebook.
-3. For chapters 4–6: **Runtime → Change runtime type → T4 GPU**.
+3. For chapters 4–8: **Runtime → Change runtime type → T4 GPU**.
 4. Run the first cell of any notebook — it prints your environment and GPU, and installs
    anything missing.
 
@@ -99,3 +107,8 @@ The most likely places for version friction, if you hit any:
   fallback built in if the sample image isn't available).
 - `torch.amp.GradScaler` vs `torch.cuda.amp.GradScaler` — chapters 4 and 6 try both.
 - `torchvision.transforms.v2` — chapter 3 falls back to v1.
+- The FID cell in chapter 7 downloads Inception-v3 and spends most of its time in
+  `scipy.linalg.sqrtm`; it's the slowest cell in the course (~1–2 min).
+
+Rough GPU runtimes on a free Colab T4: chapters 4 and 6 about 8 minutes each, chapter 5 about 4,
+chapter 7 about 10 (two GANs plus FID), chapter 8 about 8 (two diffusion models plus sampling).

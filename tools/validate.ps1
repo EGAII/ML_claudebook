@@ -95,16 +95,20 @@ $expected = @(
     'tools/build_notebooks.ps1', 'tools/validate.ps1',
     'docs/00_setup_colab_vscode.md', 'docs/01_numpy_pandas.md', 'docs/02_ml_foundations.md',
     'docs/03_convolution.md', 'docs/04_cnn_classification.md', 'docs/05_transfer_learning.md',
-    'docs/06_segmentation.md', 'docs/90_pytorch_cheatsheet.md', 'docs/91_debugging_playbook.md',
+    'docs/06_segmentation.md', 'docs/07_gans.md', 'docs/08_diffusion.md',
+    'docs/90_pytorch_cheatsheet.md', 'docs/91_debugging_playbook.md',
     'notebooks/01_numpy_pandas.ipynb', 'notebooks/02_linear_logistic_regression.ipynb',
     'notebooks/03_convolution_image_ops.ipynb', 'notebooks/04_cnn_classification.ipynb',
     'notebooks/05_transfer_learning.ipynb', 'notebooks/06_segmentation_unet.ipynb',
+    'notebooks/07_gan_dcgan.ipynb', 'notebooks/08_diffusion_ddpm.ipynb',
     'exercises/ex01_numpy_pandas.ipynb', 'exercises/ex02_regression.ipynb',
     'exercises/ex03_convolution.ipynb', 'exercises/ex04_cnn.ipynb',
     'exercises/ex05_transfer.ipynb', 'exercises/ex06_segmentation.ipynb',
+    'exercises/ex07_gan.ipynb', 'exercises/ex08_diffusion.ipynb',
     'exercises/solutions/sol01_numpy_pandas.ipynb', 'exercises/solutions/sol02_regression.ipynb',
     'exercises/solutions/sol03_convolution.ipynb', 'exercises/solutions/sol04_cnn.ipynb',
-    'exercises/solutions/sol05_transfer.ipynb', 'exercises/solutions/sol06_segmentation.ipynb'
+    'exercises/solutions/sol05_transfer.ipynb', 'exercises/solutions/sol06_segmentation.ipynb',
+    'exercises/solutions/sol07_gan.ipynb', 'exercises/solutions/sol08_diffusion.ipynb'
 )
 foreach ($e in $expected) {
     if (-not (Test-Path (Join-Path $Root $e))) { Fail "missing: $e" }

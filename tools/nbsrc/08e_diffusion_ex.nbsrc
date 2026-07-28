@@ -1,0 +1,475 @@
+#out exercises/ex08_diffusion.ipynb
+#gpu on
+
+#%% md
+# Exercise 8 - Diffusion models
+
+> **GPU: Runtime -> Change runtime type -> T4 GPU.** About 7 minutes.
+
+Dataset: **FashionMNIST at 32x32** (the lesson used MNIST). Nine tasks, building DDPM from the
+equation up.
+
+The single most useful thing in this exercise is task 3: a **noise-prediction identity check** that
+catches almost every possible sign or scaling error in your forward process, before you waste an
+epoch training on it.
+
+#%% code
+import time, math
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
+from torchvision.utils import make_grid
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print('torch', torch.__version__, '| device', device)
+if device.type != 'cuda':
+    print('*** no GPU: switch the runtime, or cut EPOCHS and T ***')
+
+try:
+    import google.colab  # noqa: F401
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+DATA_DIR = '/content/data' if IN_COLAB else './data'
+NUM_WORKERS = 2 if IN_COLAB else 0
+
+def set_seed(seed=0):
+    import random
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+set_seed(0)
+torch.backends.cudnn.benchmark = True
+plt.rcParams['figure.dpi'] = 110
+
+IMG_SIZE, T, N_CLASSES = 32, 400, 10
+tf = transforms.Compose([transforms.Resize(IMG_SIZE), transforms.ToTensor(),
+                         transforms.Normalize((0.5,), (0.5,))])
+full_ds = datasets.FashionMNIST(DATA_DIR, train=True, download=True, transform=tf)
+train_ds = Subset(full_ds, range(16000))
+loader = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=NUM_WORKERS,
+                    pin_memory=device.type == 'cuda', drop_last=True)
+CLASSES = full_ds.classes
+
+def to_img(t):
+    return ((t.detach().cpu() + 1) / 2).clamp(0, 1)
+
+def show_grid(t, nrow=8, title='', figsize=(7, 7)):
+    g = make_grid(to_img(t), nrow=nrow, padding=2)
+    plt.figure(figsize=figsize); plt.imshow(g.permute(1, 2, 0).numpy(), cmap='gray')
+    plt.axis('off'); plt.title(title); plt.show()
+
+xb, yb = next(iter(loader))
+print(f'{len(train_ds)} images | batch {tuple(xb.shape)} in ({xb.min():.2f}, {xb.max():.2f}) | T={T}')
+show_grid(xb[:16], nrow=8, title='real FashionMNIST', figsize=(7, 2))
+
+#%% md
+---
+## Task 1 - The cosine schedule
+
+Implement the improved-DDPM cosine schedule. It defines $\bar\alpha$ **first** and derives $\beta$
+from it:
+
+$$\bar\alpha_t = \frac{f(t)}{f(0)}, \quad f(t) = \cos^2\!\left(\frac{t/T + s}{1+s}\cdot\frac{\pi}{2}\right), \quad
+\beta_t = 1 - \frac{\bar\alpha_t}{\bar\alpha_{t-1}}$$
+
+with $s = 0.008$. Compute $f$ over `T+1` points, take ratios of consecutive values, and clamp
+$\beta$ to at most 0.999.
+
+#%% code
+def linear_schedule(T, beta_start=1e-4, beta_end=0.02):
+    return torch.linspace(beta_start, beta_end, T)
+
+def cosine_schedule(T, s=0.008):
+    """-> (T,) tensor of betas."""
+    # TODO
+    raise NotImplementedError
+
+
+bl, bc = linear_schedule(T), cosine_schedule(T)
+assert bc.shape == (T,), f'shape {tuple(bc.shape)} should be ({T},)'
+assert bc.dtype == torch.float32, f'dtype {bc.dtype}'
+assert (bc > 0).all() and (bc <= 0.999).all(), 'betas must be in (0, 0.999]'
+assert bc[0] < bc[-1], 'beta should increase with t'
+ab_c = torch.cumprod(1 - bc, 0)
+ab_l = torch.cumprod(1 - bl, 0)
+assert ab_c[0] > 0.999, f'alpha_bar[0] should be ~1, got {ab_c[0]:.4f}'
+assert ab_c[-1] < 0.02, f'alpha_bar[T-1] should be ~0, got {ab_c[-1]:.4f}'
+assert ab_c[T // 2] > ab_l[T // 2], 'cosine should retain MORE signal at the halfway point than linear'
+print(f'PASS  cosine: ab[0]={ab_c[0]:.4f} ab[T/2]={ab_c[T // 2]:.4f} ab[T-1]={ab_c[-1]:.4f}')
+print(f'      linear: ab[0]={ab_l[0]:.4f} ab[T/2]={ab_l[T // 2]:.4f} ab[T-1]={ab_l[-1]:.4f}')
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.2))
+axes[0].plot(bl, label='linear'); axes[0].plot(bc, label='cosine'); axes[0].set_title('beta_t')
+axes[1].plot(ab_l, label='linear'); axes[1].plot(ab_c, label='cosine'); axes[1].set_title('alpha_bar_t')
+for ax in axes:
+    ax.set_xlabel('t'); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+plt.tight_layout()
+
+#%% md
+---
+## Task 2 - The `Diffusion` helper
+
+Build a class holding the schedule and every derived constant, with a `q_sample` implementing
+
+$$x_t = \sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\varepsilon$$
+
+`q_sample(x0, t, noise=None)` must accept a **per-image** `t` of shape `(B,)` and return
+`(x_t, noise)`. Watch the broadcasting: you index a `(T,)` table with a `(B,)` tensor and must
+multiply a `(B,1,1,1)` result against `(B,1,H,W)`.
+
+#%% code
+class Diffusion:
+    def __init__(self, betas, device):
+        # TODO: store betas, alphas, alpha_bars, sqrt_ab, sqrt_1mab, sqrt_recip_alphas, T
+        raise NotImplementedError
+
+    def q_sample(self, x0, t, noise=None):
+        """-> (x_t, noise). t is (B,) of ints."""
+        # TODO
+        raise NotImplementedError
+
+
+diffusion = Diffusion(cosine_schedule(T), device)
+assert diffusion.T == T
+for name in ['betas', 'alphas', 'alpha_bars', 'sqrt_ab', 'sqrt_1mab', 'sqrt_recip_alphas']:
+    v = getattr(diffusion, name)
+    assert v.shape == (T,), f'{name} shape {tuple(v.shape)}'
+    assert v.device.type == device.type, f'{name} is on {v.device}, should be on {device}'
+
+x0 = xb[:64].to(device)
+t_zero = torch.zeros(64, device=device, dtype=torch.long)
+xt0, eps0 = diffusion.q_sample(x0, t_zero)
+assert xt0.shape == x0.shape and eps0.shape == x0.shape
+assert (xt0 - x0).abs().mean() < 0.15, 'at t=0 the noisy image should be very close to the original'
+
+t_max = torch.full((64,), T - 1, device=device, dtype=torch.long)
+xtT, _ = diffusion.q_sample(x0, t_max)
+assert abs(float(xtT.std()) - 1.0) < 0.15, f'at t=T-1, std should be ~1, got {xtT.std():.3f}'
+assert abs(float(xtT.mean())) < 0.15, f'at t=T-1, mean should be ~0, got {xtT.mean():+.3f}'
+
+t_mixed = torch.randint(0, T, (64,), device=device)
+xt_m, _ = diffusion.q_sample(x0, t_mixed)
+assert xt_m.shape == x0.shape, 'per-image t must work, not just a single scalar t'
+early, late = t_mixed.argmin(), t_mixed.argmax()
+assert (xt_m[early] - x0[early]).abs().mean() < (xt_m[late] - x0[late]).abs().mean(), \
+    'the image with the smaller t should be LESS corrupted - is your indexing per-image?'
+print('PASS  q_sample works, including per-image timesteps')
+
+ts_show = [0, T // 8, T // 4, T // 2, 3 * T // 4, T - 1]
+fig, axes = plt.subplots(1, len(ts_show), figsize=(2 * len(ts_show), 2.4))
+for ax, t in zip(axes, ts_show):
+    set_seed(3)
+    xt, _ = diffusion.q_sample(x0[:1], torch.full((1,), t, device=device, dtype=torch.long))
+    ax.imshow(to_img(xt)[0, 0].numpy(), cmap='gray')
+    ax.set_title(f't={t}\nab={diffusion.alpha_bars[t]:.2f}', fontsize=8); ax.axis('off')
+plt.suptitle('forward diffusion'); plt.tight_layout()
+
+#%% md
+---
+## Task 3 - The identity check (do this before training anything)
+
+Given $x_t$ and the noise $\varepsilon$ that produced it, you can **recover $x_0$ exactly**:
+
+$$x_0 = \frac{x_t - \sqrt{1-\bar\alpha_t}\,\varepsilon}{\sqrt{\bar\alpha_t}}$$
+
+Implement `predict_x0_from_eps` and confirm it inverts `q_sample` to floating-point precision at
+many timesteps.
+
+This is the highest-value check in the whole chapter: a sign error, a swapped `sqrt_ab`/`sqrt_1mab`,
+or a missing square root will all pass a shape assertion and then quietly ruin your samples. This
+catches every one of them in a second.
+
+#%% code
+def predict_x0_from_eps(diffusion, xt, t, eps):
+    """Invert q_sample: recover x_0 given x_t, t and the exact noise eps."""
+    # TODO
+    raise NotImplementedError
+
+
+worst = 0.0
+for t_val in [0, 1, 10, 50, T // 4, T // 2, 3 * T // 4, T - 2, T - 1]:
+    t = torch.full((64,), t_val, device=device, dtype=torch.long)
+    xt, eps = diffusion.q_sample(x0, t)
+    rec = predict_x0_from_eps(diffusion, xt, t, eps)
+    err = (rec - x0).abs().max().item()
+    worst = max(worst, err)
+    assert err < 2e-2, f'at t={t_val} the reconstruction is off by {err:.4f} - check your algebra'
+print(f'PASS  x0 recovered at every timestep; worst error {worst:.2e}')
+print('\nThe error grows with t (dividing by a tiny sqrt(ab) amplifies float32 noise) but stays')
+print('small. If yours is large at ALL t, you have swapped a coefficient. If it is fine at small t')
+print('and enormous at large t, check that you divide by sqrt(ab) rather than multiply.')
+
+fig, axes = plt.subplots(1, 4, figsize=(10, 2.6))
+t = torch.full((64,), T // 2, device=device, dtype=torch.long)
+xt, eps = diffusion.q_sample(x0, t)
+rec = predict_x0_from_eps(diffusion, xt, t, eps)
+for ax, (im, ttl) in zip(axes, [(x0[0], 'x_0'), (xt[0], f'x_t (t={T // 2})'),
+                                (eps[0], 'the noise eps'), (rec[0], 'recovered x_0')]):
+    ax.imshow(to_img(im)[0].numpy(), cmap='gray'); ax.set_title(ttl, fontsize=9); ax.axis('off')
+plt.tight_layout()
+
+#%% md
+---
+## Task 4 - Sinusoidal timestep embeddings
+
+Implement `timestep_embedding(t, dim)` -> `(B, dim)`, using frequencies
+$\omega_i = \exp(-\ln(10000)\cdot i / (\text{dim}/2))$ for $i = 0 \dots \text{dim}/2 - 1$, and
+concatenating `cos` then `sin`.
+
+Then answer: why not just feed the network `t` as a single number?
+
+#%% code
+def timestep_embedding(t, dim):
+    """(B,) int timesteps -> (B, dim) float features."""
+    # TODO
+    raise NotImplementedError
+
+
+e = timestep_embedding(torch.arange(T, device=device), 128)
+assert e.shape == (T, 128), f'shape {tuple(e.shape)}'
+assert e.dtype == torch.float32
+assert torch.allclose(e[0][:64], torch.ones(64, device=device), atol=1e-5), \
+    'at t=0 all the cos terms should be 1'
+assert e[0][64:].abs().max() < 1e-6, 'at t=0 all the sin terms should be 0'
+n = F.normalize(e, dim=1)
+sim = n @ n.T
+assert sim[10, 11] > sim[10, 200], 'nearby timesteps should be MORE similar than distant ones'
+assert sim.diagonal().min() > 0.999, 'each embedding should be identical to itself'
+assert not torch.allclose(e[50], e[51], atol=1e-3), 'adjacent timesteps must be distinguishable'
+print(f'PASS  embeddings: cos-sim(t=10,t=11) {sim[10, 11]:.4f} vs cos-sim(t=10,t=200) {sim[10, 200]:.4f}')
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.2))
+im = axes[0].imshow(e.cpu().T.numpy(), aspect='auto', cmap='RdBu_r')
+axes[0].set_xlabel('t'); axes[0].set_ylabel('dim'); axes[0].set_title('embedding matrix')
+axes[1].imshow(sim.cpu().numpy(), cmap='viridis'); axes[1].set_title('cosine similarity')
+plt.tight_layout()
+
+#%% md
+**Why not pass `t` as a single scalar?** ...
+
+---
+## Task 5 - A time-conditioned block
+
+Implement `ResBlock(c_in, c_out, t_dim)`:
+
+- `GroupNorm(8) -> SiLU -> Conv3x3` to `c_out`
+- **add** the time embedding, projected by a `Linear(t_dim, c_out)`, broadcast over H and W
+- `GroupNorm(8) -> SiLU -> Conv3x3`
+- plus a skip connection (a 1x1 conv if the channel counts differ, else identity)
+
+#%% code
+class ResBlock(nn.Module):
+    def __init__(self, c_in, c_out, t_dim, groups=8):
+        super().__init__()
+        # TODO
+        raise NotImplementedError
+
+    def forward(self, x, t_emb):
+        # TODO
+        raise NotImplementedError
+
+
+blk = ResBlock(32, 64, 128).to(device)
+x_t = torch.randn(4, 32, 16, 16, device=device)
+e1 = torch.randn(4, 128, device=device)
+out = blk(x_t, e1)
+assert out.shape == (4, 64, 16, 16), f'output {tuple(out.shape)}'
+same = ResBlock(32, 32, 128).to(device)
+assert same(x_t, e1).shape == (4, 32, 16, 16)
+assert isinstance(same.skip, nn.Identity), 'use nn.Identity for the skip when c_in == c_out'
+out2 = blk(x_t, torch.randn(4, 128, device=device))
+assert not torch.allclose(out, out2, atol=1e-4), 'a different time embedding must change the output'
+assert sum(1 for m in blk.modules() if isinstance(m, nn.GroupNorm)) == 2, 'two GroupNorms'
+print(f'PASS  ResBlock: {tuple(x_t.shape)} -> {tuple(out.shape)}, {sum(p.numel() for p in blk.parameters()):,} params')
+print('      time embedding demonstrably affects the output')
+
+#%% md
+---
+## Task 6 - The U-Net
+
+Assemble `TimeUNet(c_in=1, base=32, t_dim=128, n_classes=None)`:
+
+- `time_mlp`: `Linear(t_dim, t_dim) -> SiLU -> Linear(t_dim, t_dim)`
+- optional `class_emb`: `Embedding(n_classes + 1, t_dim)` (**+1** for the null token used by guidance),
+  **added** to the time embedding
+- 32 -> 16 -> 8 with two strided convs, back up with `Upsample + Conv`, **concatenating** skips
+- output: `GroupNorm -> SiLU -> Conv3x3` to `c_in` channels, predicting the **noise**
+
+#%% code
+class Up(nn.Module):
+    def __init__(self, c_in, c_out):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode='nearest')
+        self.conv = nn.Conv2d(c_in, c_out, 3, padding=1)
+
+    def forward(self, x):
+        return self.conv(self.up(x))
+
+
+class TimeUNet(nn.Module):
+    def __init__(self, c_in=1, base=32, t_dim=128, n_classes=None):
+        super().__init__()
+        # TODO
+        raise NotImplementedError
+
+    def forward(self, x, t, y=None):
+        # TODO
+        raise NotImplementedError
+
+
+model = TimeUNet().to(device)
+x_test = torch.randn(4, 1, 32, 32, device=device)
+t_test = torch.randint(0, T, (4,), device=device)
+out = model(x_test, t_test)
+
+assert out.shape == x_test.shape, f'output {tuple(out.shape)} must match the input (it predicts noise)'
+assert sum(p.numel() for p in model.parameters()) < 3_000_000, 'smaller than 3M parameters, please'
+o_a = model(x_test, torch.zeros(4, dtype=torch.long, device=device))
+o_b = model(x_test, torch.full((4,), T - 1, dtype=torch.long, device=device))
+assert (o_a - o_b).abs().mean() > 1e-3, 'the timestep must change the output'
+cm = TimeUNet(n_classes=N_CLASSES).to(device)
+assert cm.class_emb.num_embeddings == N_CLASSES + 1, 'need one extra slot for the null token'
+oc = cm(x_test, t_test, torch.zeros(4, dtype=torch.long, device=device))
+on = cm(x_test, t_test, torch.full((4,), N_CLASSES, dtype=torch.long, device=device))
+assert not torch.allclose(oc, on, atol=1e-4), 'the class label must change the output'
+print(f'PASS  {sum(p.numel() for p in model.parameters()):,} params | {tuple(x_test.shape)} -> {tuple(out.shape)}')
+
+#%% md
+---
+## Task 7 - Train it
+
+Write `train_diffusion(model, epochs, ...)`. The whole loop:
+
+1. random `t` per image
+2. `xt, noise = diffusion.q_sample(x0, t)`
+3. `loss = F.mse_loss(model(xt, t), noise)`
+4. backward, step
+
+Target: final loss **below 0.06** in 15 epochs. With `cond=True`, replace the label with the null
+token `N_CLASSES` for a fraction `p_uncond` of samples.
+
+#%% code
+def train_diffusion(model, epochs, lr=2e-4, cond=False, p_uncond=0.1, log_every=3):
+    """-> list of mean per-sample losses, one per epoch."""
+    # TODO
+    raise NotImplementedError
+
+
+EPOCHS = 15
+set_seed(0)
+model = TimeUNet().to(device)
+print(f'training {EPOCHS} epochs:')
+t0 = time.perf_counter()
+hist = train_diffusion(model, EPOCHS)
+print(f'total {(time.perf_counter() - t0) / 60:.1f} min')
+
+assert len(hist) == EPOCHS
+assert hist[-1] < 0.06, f'final loss {hist[-1]:.4f} - should get below 0.06'
+assert hist[-1] < hist[0], 'the loss should decrease'
+print(f'PASS  loss {hist[0]:.4f} -> {hist[-1]:.4f}')
+
+plt.figure(figsize=(5.5, 3.2))
+plt.plot(hist, marker='.'); plt.xlabel('epoch'); plt.ylabel('MSE on the noise')
+plt.grid(alpha=0.3); plt.title('unlike a GAN, this curve means something')
+
+#%% md
+---
+## Task 8 - Sampling
+
+Implement both samplers.
+
+`ddpm_sample(model, n)` - every timestep, adding fresh noise except on the last step:
+
+$$x_{t-1} = \frac{1}{\sqrt{\alpha_t}}\left(x_t - \frac{\beta_t}{\sqrt{1-\bar\alpha_t}}\varepsilon_\theta\right) + \sqrt{\beta_t}\, z$$
+
+`ddim_sample(model, n, steps)` - deterministic, on a subsequence:
+
+$$x_{t-1} = \sqrt{\bar\alpha_{t-1}}\,\hat{x}_0 + \sqrt{1-\bar\alpha_{t-1}}\,\varepsilon_\theta,
+\qquad \hat{x}_0 = \frac{x_t - \sqrt{1-\bar\alpha_t}\varepsilon_\theta}{\sqrt{\bar\alpha_t}}$$
+
+#%% code
+@torch.no_grad()
+def ddpm_sample(model, n=16, y=None, guidance=1.0):
+    # TODO
+    raise NotImplementedError
+
+@torch.no_grad()
+def ddim_sample(model, n=16, steps=50, y=None, guidance=1.0):
+    # TODO
+    raise NotImplementedError
+
+
+def pairwise(b):
+    f = b.view(b.size(0), -1)
+    return (torch.cdist(f, f).sum() / (f.size(0) * (f.size(0) - 1))).item()
+
+set_seed(0); t0 = time.perf_counter(); s_ddpm = ddpm_sample(model, 32)
+t_ddpm = time.perf_counter() - t0
+set_seed(0); t0 = time.perf_counter(); s_ddim = ddim_sample(model, 32, steps=50)
+t_ddim = time.perf_counter() - t0
+
+assert s_ddpm.shape == (32, 1, 32, 32) and s_ddim.shape == (32, 1, 32, 32)
+assert s_ddpm.abs().max() < 5, 'samples are diverging - check the reverse step coefficients'
+assert pairwise(s_ddpm) > 5.0, f'samples are barely different ({pairwise(s_ddpm):.2f}) - did you add the noise term?'
+assert t_ddim < t_ddpm / 3, f'DDIM should be much faster: {t_ddim:.1f}s vs {t_ddpm:.1f}s'
+print(f'PASS  DDPM {T} steps in {t_ddpm:.1f}s (diversity {pairwise(s_ddpm):.2f})')
+print(f'      DDIM  50 steps in {t_ddim:.1f}s (diversity {pairwise(s_ddim):.2f}) - {t_ddpm / t_ddim:.0f}x faster')
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 5.5))
+for ax, s, ttl in zip(axes, [s_ddpm, s_ddim], [f'DDPM, {T} steps', 'DDIM, 50 steps']):
+    g = make_grid(to_img(s), nrow=8, padding=2)
+    ax.imshow(g.permute(1, 2, 0).numpy(), cmap='gray'); ax.set_title(ttl); ax.axis('off')
+plt.tight_layout()
+
+#%% md
+---
+## Task 9 - Classifier-free guidance
+
+Train a conditional model with 10% label dropout, then sample with guidance:
+
+$$\tilde\varepsilon = \varepsilon_\theta(x_t,t,\varnothing) + w\big(\varepsilon_\theta(x_t,t,y) - \varepsilon_\theta(x_t,t,\varnothing)\big)$$
+
+Produce a grid where row $i$ is garment class $i$, and a sweep over $w \in \{0, 1, 3, 6\}$.
+
+Then answer: what does raising $w$ trade away?
+
+#%% code
+set_seed(0)
+cmodel = TimeUNet(n_classes=N_CLASSES).to(device)
+print(f'training the conditional model, {EPOCHS} epochs with 10% label dropout:')
+chist = train_diffusion(cmodel, EPOCHS, cond=True, p_uncond=0.1)
+assert chist[-1] < 0.06, f'final loss {chist[-1]:.4f}'
+print(f'PASS  conditional loss {chist[0]:.4f} -> {chist[-1]:.4f} (unconditional was {hist[-1]:.4f})')
+
+set_seed(1)
+ys = torch.arange(N_CLASSES, device=device).repeat_interleave(8)
+grid = ddim_sample(cmodel, n=len(ys), steps=50, y=ys, guidance=3.0)
+assert grid.shape == (80, 1, 32, 32)
+g = make_grid(to_img(grid), nrow=8, padding=2)
+plt.figure(figsize=(8, 9.5)); plt.imshow(g.permute(1, 2, 0).numpy(), cmap='gray'); plt.axis('off')
+plt.title('conditional DDIM, w=3.0 - row i = class i'); plt.show()
+for i, c in enumerate(CLASSES):
+    print(f'  row {i}: {c}')
+
+# TODO: sweep guidance over [0.0, 1.0, 3.0, 6.0] with a fixed seed and the same 9 requested
+#       classes; plot the four grids side by side and print the diversity of each
+
+#%% md
+**What does raising the guidance scale trade away?** ...
+
+---
+## Done - and that is the whole course
+
+- [ ] I can write the closed-form forward process from memory.
+- [ ] I check `predict_x0_from_eps` inverts `q_sample` before training anything.
+- [ ] I know why the sampler must inject noise, and what happens without it.
+- [ ] I can explain the guidance scale to someone using a text-to-image tool.
+
+Solutions: [`solutions/sol08_diffusion.ipynb`](solutions/sol08_diffusion.ipynb)
+
+Then: the end of [`docs/08_diffusion.md`](../docs/08_diffusion.md) for where to go next.

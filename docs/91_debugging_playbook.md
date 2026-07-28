@@ -231,6 +231,41 @@ Diagnose first: if GPU utilization is low, you're **data-bound**, and a faster m
 
 ---
 
+## GAN specific
+
+| Symptom | Cause |
+|---|---|
+| All samples nearly identical | mode collapse — lower G's LR, label smoothing, spectral norm, WGAN-GP |
+| D loss → 0, G loss → ∞ | D won; **weaken** D (smaller, lower LR, smooth its labels) |
+| Samples are pure noise, both losses flat | D too weak to teach; or `.detach()` missing so G is being trained by D's loss |
+| G never updates at all | `zero_grad()` called after `backward()`; or `opt_G` built on D's parameters |
+| Loss goes to `-inf` then `nan` | you used the negated saturating loss; use `bce(D(fake), ones)` |
+| Samples have a visible grid pattern | checkerboard artifacts — kernel size not divisible by stride in `ConvTranspose2d` |
+| D hits 100% accuracy in the first epoch | output activation doesn't match the data range (tanh vs `[0,1]` data) |
+| Generator ignores the class label | D isn't conditioned on the label |
+| Interpolation midpoints look washed out | linear interpolation in latent space — use slerp |
+| "Loss went down, is it working?" | **GAN loss is not a progress signal.** Look at samples and D's accuracy |
+
+## Diffusion specific
+
+| Symptom | Cause |
+|---|---|
+| Loss plateaus at exactly 1.0 | the model is predicting zeros — target noise differs from the noise used in `q_sample` |
+| Samples are structured garbage | `sqrt_recip_alphas` built from `alpha_bar` instead of `alpha`; check the reverse-step coefficients |
+| All samples nearly identical | you forgot to inject noise during sampling (or added it on the final step too) |
+| Final samples look grainy | noise added at `t == 0`; guard with `if t > 0` |
+| `nan` immediately | `beta` reaching 1 (divide by `sqrt(alpha)=0`) — clamp betas to ≤ 0.999 |
+| Broadcast error in `q_sample` | schedule table indexed `(B,)` needs `.view(-1, 1, 1, 1)` |
+| Reconstruction check fails at all `t` | `sqrt_ab` / `sqrt_1mab` swapped |
+| Check fine at small `t`, huge at large `t` | multiplying by `sqrt_ab` where you should divide |
+| Class label has no effect | forgot the `+1` null slot, or the embedding isn't added to the time embedding |
+| Guidance does nothing | `p_uncond=0`, so the null token was never trained |
+| Samples over-smoothed at few steps | normal DDIM discretization error — use more steps or a better solver |
+
+**The check that catches most of these:** verify that
+`predict_x0_from_eps(q_sample(x0, t, eps), t, eps) == x0` at many `t`, before you train anything. It's
+an exact algebraic identity, so any deviation beyond float32 noise is a bug.
+
 ## Transfer learning specific
 
 | Symptom | Cause |

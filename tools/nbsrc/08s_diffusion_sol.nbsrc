@@ -1,0 +1,714 @@
+#out exercises/solutions/sol08_diffusion.ipynb
+#gpu on
+
+#%% md
+# Solutions 8 - Diffusion models (FashionMNIST)
+
+Answers to [`ex08_diffusion.ipynb`](../ex08_diffusion.ipynb), with reasoning.
+
+> **GPU: Runtime -> Change runtime type -> T4 GPU.**
+
+#%% code
+import time, math
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
+from torchvision.utils import make_grid
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print('torch', torch.__version__, '| device', device)
+
+try:
+    import google.colab  # noqa: F401
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+DATA_DIR = '/content/data' if IN_COLAB else './data'
+NUM_WORKERS = 2 if IN_COLAB else 0
+
+def set_seed(seed=0):
+    import random
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+set_seed(0)
+torch.backends.cudnn.benchmark = True
+plt.rcParams['figure.dpi'] = 110
+
+IMG_SIZE, T, N_CLASSES = 32, 400, 10
+tf = transforms.Compose([transforms.Resize(IMG_SIZE), transforms.ToTensor(),
+                         transforms.Normalize((0.5,), (0.5,))])
+full_ds = datasets.FashionMNIST(DATA_DIR, train=True, download=True, transform=tf)
+train_ds = Subset(full_ds, range(16000))
+loader = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=NUM_WORKERS,
+                    pin_memory=device.type == 'cuda', drop_last=True)
+CLASSES = full_ds.classes
+
+def to_img(t):
+    return ((t.detach().cpu() + 1) / 2).clamp(0, 1)
+
+def show_grid(t, nrow=8, title='', figsize=(7, 7)):
+    g = make_grid(to_img(t), nrow=nrow, padding=2)
+    plt.figure(figsize=figsize); plt.imshow(g.permute(1, 2, 0).numpy(), cmap='gray')
+    plt.axis('off'); plt.title(title); plt.show()
+
+xb, yb = next(iter(loader))
+print(f'{len(train_ds)} images | batch {tuple(xb.shape)} | T={T}')
+
+#%% md
+---
+## Task 1 - The cosine schedule
+
+#%% code
+def linear_schedule(T, beta_start=1e-4, beta_end=0.02):
+    return torch.linspace(beta_start, beta_end, T)
+
+
+def cosine_schedule(T, s=0.008):
+    steps = torch.arange(T + 1, dtype=torch.float64) / T      # float64: we take ratios
+    ab = torch.cos((steps + s) / (1 + s) * math.pi / 2) ** 2
+    ab = ab / ab[0]                                           # normalize so alpha_bar[0] == 1
+    betas = 1 - (ab[1:] / ab[:-1])                            # beta_t = 1 - ab_t / ab_{t-1}
+    return betas.clamp(0, 0.999).float()
+
+
+bl, bc = linear_schedule(T), cosine_schedule(T)
+ab_c, ab_l = torch.cumprod(1 - bc, 0), torch.cumprod(1 - bl, 0)
+assert (bc > 0).all() and (bc <= 0.999).all() and ab_c[0] > 0.999 and ab_c[-1] < 0.02
+assert ab_c[T // 2] > ab_l[T // 2]
+print(f'PASS  cosine ab: [0]={ab_c[0]:.4f} [T/2]={ab_c[T // 2]:.4f} [T-1]={ab_c[-1]:.2e}')
+print(f'      linear ab: [0]={ab_l[0]:.4f} [T/2]={ab_l[T // 2]:.4f} [T-1]={ab_l[-1]:.2e}')
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.2))
+axes[0].plot(bl, label='linear'); axes[0].plot(bc, label='cosine'); axes[0].set_title('beta_t')
+axes[1].plot(ab_l, label='linear'); axes[1].plot(ab_c, label='cosine'); axes[1].set_title('alpha_bar_t')
+for ax in axes:
+    ax.set_xlabel('t'); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+plt.tight_layout()
+
+#%% md
+### Why it's defined this way round
+
+**$\bar\alpha$ first, $\beta$ derived.** The linear schedule specifies $\beta_t$ and lets
+$\bar\alpha_t = \prod(1-\beta_s)$ fall out — and what falls out is bad: an exponential decay that
+annihilates the signal in the first half of the process. The cosine schedule inverts the design: state
+the signal-decay curve you *want*, then solve for the $\beta$ that produces it. Since
+$\bar\alpha_t = \prod_{s\le t}\alpha_s$, consecutive ratios give
+$\alpha_t = \bar\alpha_t / \bar\alpha_{t-1}$, hence $\beta_t = 1 - \bar\alpha_t/\bar\alpha_{t-1}$.
+
+**Why `T+1` points.** You need $\bar\alpha_0 \dots \bar\alpha_T$ to form $T$ consecutive ratios. Using
+`T` points gives `T-1` betas and an off-by-one that shifts your whole schedule — it trains, slightly
+worse, and you never find out.
+
+**`ab = ab / ab[0]`** because the $s = 0.008$ offset makes $f(0) \ne 1$ exactly. Without this,
+$\bar\alpha_0 \approx 0.9998$ and $x_0$ is *already slightly noisy* at $t=0$, so the model never sees
+clean data.
+
+**Why `s = 0.008` at all.** It prevents $\beta_1$ from being exactly 0. A zero $\beta$ means
+$\alpha=1$, and the reverse step divides by $\sqrt{1-\bar\alpha_t}$ — which is 0 at $t=0$, giving
+`inf`. The offset is a guard against division by zero at the start of the schedule.
+
+**`float64` then `.float()`.** We take ratios of numbers approaching zero. In float32 the late ratios
+lose precision badly and can go negative, giving `beta > 1` and `nan` alphas. Compute in double,
+downcast at the end.
+
+**`clamp(0, 0.999)`.** At $t=T$ the cosine hits exactly 0, so the final ratio is $0/\epsilon = 0$ and
+$\beta_T = 1$, i.e. $\alpha_T = 0$ — the reverse step then divides by $\sqrt{\alpha_t} = 0$. Capping at
+0.999 keeps the sampler finite.
+
+#%% md
+---
+## Task 2 - The `Diffusion` helper
+
+#%% code
+class Diffusion:
+    def __init__(self, betas, device):
+        self.T = len(betas)
+        self.betas = betas.to(device)
+        self.alphas = 1.0 - self.betas
+        self.alpha_bars = torch.cumprod(self.alphas, dim=0)
+        self.sqrt_ab = self.alpha_bars.sqrt()
+        self.sqrt_1mab = (1.0 - self.alpha_bars).sqrt()
+        self.sqrt_recip_alphas = (1.0 / self.alphas).sqrt()
+
+    def q_sample(self, x0, t, noise=None):
+        if noise is None:
+            noise = torch.randn_like(x0)
+        ab = self.sqrt_ab[t].view(-1, 1, 1, 1)          # (B,) -> (B,1,1,1)
+        om = self.sqrt_1mab[t].view(-1, 1, 1, 1)
+        return ab * x0 + om * noise, noise
+
+
+diffusion = Diffusion(cosine_schedule(T), device)
+x0 = xb[:64].to(device)
+xt0, _ = diffusion.q_sample(x0, torch.zeros(64, device=device, dtype=torch.long))
+xtT, _ = diffusion.q_sample(x0, torch.full((64,), T - 1, device=device, dtype=torch.long))
+t_mixed = torch.randint(0, T, (64,), device=device)
+xt_m, _ = diffusion.q_sample(x0, t_mixed)
+assert (xt0 - x0).abs().mean() < 0.15
+assert abs(float(xtT.std()) - 1.0) < 0.15 and abs(float(xtT.mean())) < 0.15
+early, late = t_mixed.argmin(), t_mixed.argmax()
+assert (xt_m[early] - x0[early]).abs().mean() < (xt_m[late] - x0[late]).abs().mean()
+print(f'PASS  t=0: diff {(xt0 - x0).abs().mean():.4f} | t=T-1: mean {xtT.mean():+.3f} std {xtT.std():.3f}')
+
+#%% md
+### Why the `.view(-1, 1, 1, 1)`
+
+`self.sqrt_ab` is a `(T,)` lookup table. Indexing it with a `(B,)` tensor of timesteps gives `(B,)` —
+one coefficient per image. But `x0` is `(B, 1, H, W)`, and broadcasting aligns **from the right**
+(chapter 1), so `(B,) * (B,1,H,W)` tries to match `B` against `W`. Either it errors, or — if your batch
+size happens to equal your image width — it silently does something absurd.
+
+`.view(-1, 1, 1, 1)` makes it `(B,1,1,1)`, which broadcasts correctly over channels, height and width.
+This is the same `mean[:, None, None]` pattern from chapter 1, and it is the single most common bug in
+hand-written diffusion code.
+
+**Precompute everything in `__init__`, on the device.** These are read once per training step. Computing
+`alpha_bars.sqrt()` inside the loop means launching kernels and, worse, if the tables live on the CPU
+you get a host-to-device sync on every step — which can dominate the runtime of a small model.
+
+**Why `q_sample` returns the noise too.** The noise *is* the training target. Returning it prevents the
+classic bug of generating one noise sample for `q_sample` and a *different* one as the target, which
+gives a model that dutifully learns to predict zero (the mean of the target given the input).
+
+**`sqrt_recip_alphas` is $1/\sqrt{\alpha_t}$, not $\sqrt{1/\bar\alpha_t}$.** Plain alpha, not alpha-bar.
+Mixing those up is a favourite error; the samples come out as structured garbage rather than noise,
+which is a confusing signal because it *looks* like the model half-learned something.
+
+#%% md
+---
+## Task 3 - The identity check
+
+#%% code
+def predict_x0_from_eps(diffusion, xt, t, eps):
+    ab = diffusion.sqrt_ab[t].view(-1, 1, 1, 1)
+    om = diffusion.sqrt_1mab[t].view(-1, 1, 1, 1)
+    return (xt - om * eps) / ab
+
+
+worst = 0.0
+print(f'{"t":>5} {"sqrt(ab)":>10} {"max error":>12}')
+for t_val in [0, 1, 10, 50, T // 4, T // 2, 3 * T // 4, T - 2, T - 1]:
+    t = torch.full((64,), t_val, device=device, dtype=torch.long)
+    xt, eps = diffusion.q_sample(x0, t)
+    err = (predict_x0_from_eps(diffusion, xt, t, eps) - x0).abs().max().item()
+    worst = max(worst, err)
+    print(f'{t_val:5d} {diffusion.sqrt_ab[t_val]:10.5f} {err:12.2e}')
+    assert err < 2e-2
+print(f'\nPASS  worst error {worst:.2e}')
+
+#%% md
+### Why this check is worth so much
+
+It is an **exact algebraic identity**, so any deviation beyond float32 noise is a bug. Rearranging
+$x_t = \sqrt{\bar\alpha_t}x_0 + \sqrt{1-\bar\alpha_t}\varepsilon$ for $x_0$ is trivial — which is
+exactly why it makes a perfect test: there is no room for a "reasonable but different" answer.
+
+What it catches that a shape assertion cannot:
+
+| Bug | Symptom in this test |
+|---|---|
+| `sqrt_ab` / `sqrt_1mab` swapped | large error at *every* $t$ |
+| missing square root | error grows smoothly with $t$ |
+| multiply instead of divide by `sqrt_ab` | fine at $t=0$, enormous at large $t$ |
+| sign error on the noise term | error roughly doubles at mid $t$ |
+| wrong broadcast (`view` missing) | either a crash, or per-image mismatch |
+
+Notice the error *does* grow with $t$: at $t = T-1$, $\sqrt{\bar\alpha_t}$ is around $10^{-3}$, and
+dividing by it amplifies float32 rounding by ~1000x. That's inherent, not a bug — and it's also why
+**$x_0$-prediction is numerically awkward at large $t$**, one more reason to predict $\varepsilon$
+instead.
+
+This identity is not just a test. `predict_x0_from_eps` is a component of the DDIM sampler (task 8),
+and clamping its output to $[-1,1]$ mid-sampling is a standard trick that measurably improves samples —
+it injects the knowledge that images are bounded, which the network doesn't otherwise have.
+
+#%% md
+---
+## Task 4 - Sinusoidal timestep embeddings
+
+#%% code
+def timestep_embedding(t, dim):
+    half = dim // 2
+    freqs = torch.exp(-math.log(10000) * torch.arange(half, device=t.device).float() / half)
+    args = t[:, None].float() * freqs[None]                # (B, 1) * (1, half) -> (B, half)
+    return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+
+
+e = timestep_embedding(torch.arange(T, device=device), 128)
+n = F.normalize(e, dim=1)
+sim = n @ n.T
+assert e.shape == (T, 128)
+assert torch.allclose(e[0][:64], torch.ones(64, device=device), atol=1e-5)
+assert sim[10, 11] > sim[10, 200] and not torch.allclose(e[50], e[51], atol=1e-3)
+print(f'PASS  cos-sim(10,11)={sim[10, 11]:.4f} > cos-sim(10,200)={sim[10, 200]:.4f}')
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.2))
+im = axes[0].imshow(e.cpu().T.numpy(), aspect='auto', cmap='RdBu_r')
+axes[0].set_xlabel('t'); axes[0].set_ylabel('dim'); axes[0].set_title('embedding matrix')
+axes[1].imshow(sim.cpu().numpy(), cmap='viridis'); axes[1].set_title('cosine similarity')
+plt.tight_layout()
+
+#%% md
+### Why not pass `t` as a scalar
+
+Three reasons, in increasing importance.
+
+**1. Magnitude.** A raw `t` ranges over 0-399 while every other activation is roughly unit-scale. Fed
+into a linear layer it either dominates everything or gets scaled to irrelevance. You'd have to
+normalize it — and then you've started designing an encoding anyway.
+
+**2. Capacity.** One scalar into a `Linear` gives the network exactly a **one-dimensional** family of
+behaviours: every effect of $t$ must be monotone along a single direction in feature space. But the
+correct behaviour at $t=10$ (remove a whisper of noise, preserve every edge) and at $t=390$ (hallucinate
+global structure from static) are not two points on a line — they're qualitatively different operations.
+A 128-dimensional code lets the network learn a genuinely nonlinear schedule of behaviours.
+
+**3. Resolution with smoothness.** This is the real reason, and it's the same one transformers have for
+positions. The multi-frequency code is:
+
+- **smooth** — adjacent timesteps have nearly identical embeddings (cos-sim ≈ 0.999 above), so what the
+  network learns at $t=200$ transfers to $t=201$. Without that, each of the 400 timesteps is an
+  independent task and you'd need 400x the data.
+- **distinguishable** — distant timesteps are nearly orthogonal, so the network *can* behave differently
+  where it needs to.
+
+A learned `nn.Embedding(T, dim)` gets resolution but loses smoothness — no parameter sharing between
+neighbouring timesteps. Sinusoids give both for free, and generalize to timesteps never seen during
+training (which is what lets DDIM sample on an arbitrary subsequence).
+
+**Implementation notes.** The geometric frequency spacing (`exp(-log(10000) * i/half)`) spans
+wavelengths from ~1 to ~10000, so some dimensions distinguish adjacent steps and others encode coarse
+position. And `cos` first then `sin` is arbitrary — the original code does `sin` first; it makes no
+difference, but the assertion in the exercise pins one convention so the test is checkable.
+
+#%% md
+---
+## Task 5 - The time-conditioned residual block
+
+#%% code
+class ResBlock(nn.Module):
+    def __init__(self, c_in, c_out, t_dim, groups=8):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(groups, c_in)
+        self.conv1 = nn.Conv2d(c_in, c_out, 3, padding=1)
+        self.t_proj = nn.Linear(t_dim, c_out)
+        self.norm2 = nn.GroupNorm(groups, c_out)
+        self.conv2 = nn.Conv2d(c_out, c_out, 3, padding=1)
+        self.skip = nn.Conv2d(c_in, c_out, 1) if c_in != c_out else nn.Identity()
+
+    def forward(self, x, t_emb):
+        h = self.conv1(F.silu(self.norm1(x)))
+        h = h + self.t_proj(F.silu(t_emb))[:, :, None, None]     # (B,C) -> (B,C,1,1)
+        h = self.conv2(F.silu(self.norm2(h)))
+        return h + self.skip(x)
+
+
+blk = ResBlock(32, 64, 128).to(device)
+x_t, e1 = torch.randn(4, 32, 16, 16, device=device), torch.randn(4, 128, device=device)
+out = blk(x_t, e1)
+assert out.shape == (4, 64, 16, 16)
+assert isinstance(ResBlock(32, 32, 128).skip, nn.Identity)
+assert not torch.allclose(out, blk(x_t, torch.randn(4, 128, device=device)), atol=1e-4)
+print(f'PASS  {tuple(x_t.shape)} -> {tuple(out.shape)}, {sum(p.numel() for p in blk.parameters()):,} params')
+
+#%% md
+### Why the design is like this
+
+**Time is *added*, not concatenated.** Adding a per-channel value is a **bias shift**, applied after the
+first convolution: it says "for this noise level, offset these features". Concatenation would work but
+costs `t_dim` extra input channels in every block, and additive conditioning is what every real
+implementation uses (it's the same mechanism as FiLM, and as a transformer's positional encoding).
+
+**`[:, :, None, None]`** turns `(B, C)` into `(B, C, 1, 1)` so the shift broadcasts across every spatial
+position. **Broadcasting is the point**: the noise level is a global property of the image, so it must
+apply identically everywhere. Getting this wrong (e.g. `.view(B, 1, 1, C)`) gives a silent, wrong
+broadcast.
+
+**GroupNorm, not BatchNorm.** Two solid reasons:
+
+1. **Batch-size independence.** Diffusion trains at whatever batch fits, and GroupNorm's statistics are
+   per-sample, so behaviour doesn't change with batch size and there's no train/eval discrepancy — no
+   running statistics to get wrong (chapter 5's freezing trap simply doesn't exist).
+2. **Each sample has its own noise level.** In a batch, one image might be at $t=5$ and another at
+   $t=395$, with wildly different statistics. BatchNorm would normalize using the *mixture* of all noise
+   levels in the batch, coupling unrelated samples and injecting noise into exactly the signal the model
+   needs.
+
+**SiLU (`x * sigmoid(x)`), not ReLU.** Smooth and non-monotone. Diffusion models predict a
+continuous-valued output whose scale must be precise; ReLU's hard zero region discards gradient
+information that matters when the target is a real-valued residual rather than a class score. Every
+modern diffusion U-Net uses SiLU or GELU.
+
+**Norm *before* conv (pre-activation).** `norm -> act -> conv` rather than `conv -> norm -> act`. It keeps
+the residual path a clean identity — the skip connection adds an unnormalized `x` straight through —
+which is what makes deep residual stacks train stably. Same reason as ResNet v2.
+
+**The `1x1` conv on the skip** is only there to fix a channel mismatch. When `c_in == c_out`, use
+`nn.Identity`: a genuine identity path, no parameters, no chance of degrading the signal.
+
+#%% md
+---
+## Task 6 - The U-Net
+
+#%% code
+class Up(nn.Module):
+    def __init__(self, c_in, c_out):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode='nearest')
+        self.conv = nn.Conv2d(c_in, c_out, 3, padding=1)
+
+    def forward(self, x):
+        return self.conv(self.up(x))
+
+
+class TimeUNet(nn.Module):
+    def __init__(self, c_in=1, base=32, t_dim=128, n_classes=None):
+        super().__init__()
+        self.t_dim = t_dim
+        self.time_mlp = nn.Sequential(nn.Linear(t_dim, t_dim), nn.SiLU(), nn.Linear(t_dim, t_dim))
+        self.class_emb = nn.Embedding(n_classes + 1, t_dim) if n_classes else None
+        b = base
+        self.stem = nn.Conv2d(c_in, b, 3, padding=1)
+        self.rb1 = ResBlock(b, b, t_dim)
+        self.down1 = nn.Conv2d(b, b, 3, stride=2, padding=1)
+        self.rb2 = ResBlock(b, 2 * b, t_dim)
+        self.down2 = nn.Conv2d(2 * b, 2 * b, 3, stride=2, padding=1)
+        self.mid1 = ResBlock(2 * b, 2 * b, t_dim)
+        self.mid2 = ResBlock(2 * b, 2 * b, t_dim)
+        self.up2 = Up(2 * b, 2 * b)
+        self.rb3 = ResBlock(4 * b, 2 * b, t_dim)
+        self.up1 = Up(2 * b, b)
+        self.rb4 = ResBlock(2 * b, b, t_dim)
+        self.out = nn.Sequential(nn.GroupNorm(8, b), nn.SiLU(), nn.Conv2d(b, c_in, 3, padding=1))
+
+    def forward(self, x, t, y=None):
+        t_emb = self.time_mlp(timestep_embedding(t, self.t_dim))
+        if self.class_emb is not None:
+            assert y is not None, 'conditional model: pass y (N_CLASSES means null)'
+            t_emb = t_emb + self.class_emb(y)
+        h1 = self.rb1(self.stem(x), t_emb)                                  # (B, b, 32, 32)
+        h2 = self.rb2(self.down1(h1), t_emb)                                # (B, 2b, 16, 16)
+        m = self.mid2(self.mid1(self.down2(h2), t_emb), t_emb)              # (B, 2b, 8, 8)
+        u = self.rb3(torch.cat([self.up2(m), h2], dim=1), t_emb)            # (B, 2b, 16, 16)
+        u = self.rb4(torch.cat([self.up1(u), h1], dim=1), t_emb)            # (B, b, 32, 32)
+        return self.out(u)
+
+
+model = TimeUNet().to(device)
+x_test, t_test = torch.randn(4, 1, 32, 32, device=device), torch.randint(0, T, (4,), device=device)
+out = model(x_test, t_test)
+assert out.shape == x_test.shape and sum(p.numel() for p in model.parameters()) < 3_000_000
+assert (model(x_test, torch.zeros(4, dtype=torch.long, device=device))
+        - model(x_test, torch.full((4,), T - 1, dtype=torch.long, device=device))).abs().mean() > 1e-3
+cm_probe = TimeUNet(n_classes=N_CLASSES).to(device)
+assert cm_probe.class_emb.num_embeddings == N_CLASSES + 1
+print(f'PASS  {sum(p.numel() for p in model.parameters()):,} params, output == input shape')
+
+#%% md
+### Why this architecture
+
+**It's chapter 6's U-Net.** Same encoder-decoder, same concatenating skips, same reason: the output
+needs full resolution *and* global context. If chapter 6 felt like a detour into segmentation, this is
+the payoff — the architecture transfers unchanged.
+
+**Why a U-Net for denoising specifically.** The task is "remove noise" at every scale simultaneously.
+Fine noise is a local, high-frequency problem (the skip connections handle it); deciding *what object*
+is emerging from near-pure noise at $t=390$ is a global, low-frequency problem (the bottleneck handles
+it). Any architecture without both fails at one end: a plain conv stack produces locally-clean noise
+with no global structure; an autoencoder without skips produces blurry blobs.
+
+**`Embedding(n_classes + 1)` — the `+1` is the whole guidance mechanism.** Index `N_CLASSES` is the
+"null" token. During training we replace the real label with it 10% of the time, so the single network
+learns both $\varepsilon_\theta(x_t,t,y)$ and $\varepsilon_\theta(x_t,t,\varnothing)$. Without that extra
+slot you'd need two separate models to do classifier-free guidance.
+
+**The class embedding is *added to the time embedding*.** Not a separate pathway — the two conditioning
+signals are summed and then broadcast into every block by the same `t_proj`. It's almost suspiciously
+simple, and it is what real implementations do. Text conditioning in Stable Diffusion is the same idea
+with cross-attention instead of addition, because a text prompt is a *sequence* rather than a single
+vector.
+
+**Output predicts noise, so output channels == input channels.** No activation on the output: the noise
+is unbounded Gaussian, so a `tanh` or `sigmoid` here would be actively wrong. (Contrast with the GAN
+generator in chapter 7, which outputs an *image* and therefore needs `tanh`. Different target, different
+output layer — worth being deliberate about.)
+
+**Attention is missing here, on purpose.** The lesson notebook includes self-attention at 8x8. At this
+resolution it's a small gain; at 256x256 it's essential, because convolution's receptive field cannot
+span the image. Left out to keep the exercise focused.
+
+#%% md
+---
+## Task 7 - Training
+
+#%% code
+def train_diffusion(model, epochs, lr=2e-4, cond=False, p_uncond=0.1, log_every=3):
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    hist = []
+    for ep in range(epochs):
+        t0 = time.perf_counter()
+        model.train()
+        tot, n = 0.0, 0
+        for x0, y in loader:
+            x0 = x0.to(device, non_blocking=True)
+            t = torch.randint(0, T, (x0.size(0),), device=device)     # random t PER IMAGE
+            xt, noise = diffusion.q_sample(x0, t)
+            if cond:
+                y = y.to(device, non_blocking=True)
+                drop = torch.rand(y.shape, device=device) < p_uncond
+                y = torch.where(drop, torch.full_like(y, N_CLASSES), y)
+                pred = model(xt, t, y)
+            else:
+                pred = model(xt, t)
+            loss = F.mse_loss(pred, noise)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            tot += loss.item() * x0.size(0); n += x0.size(0)
+        sched.step()
+        hist.append(tot / n)
+        if ep % log_every == 0 or ep == epochs - 1:
+            print(f'  epoch {ep:3d}  loss {hist[-1]:.4f}  {time.perf_counter() - t0:5.1f}s')
+    return hist
+
+
+EPOCHS = 15
+set_seed(0)
+model = TimeUNet().to(device)
+print(f'training {EPOCHS} epochs:')
+t0 = time.perf_counter()
+hist = train_diffusion(model, EPOCHS)
+print(f'total {(time.perf_counter() - t0) / 60:.1f} min')
+assert hist[-1] < 0.06 and hist[-1] < hist[0]
+print(f'PASS  {hist[0]:.4f} -> {hist[-1]:.4f}')
+
+plt.figure(figsize=(5.5, 3.2))
+plt.plot(hist, marker='.'); plt.xlabel('epoch'); plt.ylabel('MSE on the noise'); plt.grid(alpha=0.3)
+
+#%% md
+### Details in the loop that matter
+
+**Random `t` per image, not per batch.** `torch.randint(0, T, (B,))` not `(1,)`. With per-batch
+timesteps every gradient step teaches the network about exactly one noise level, so the gradient is a
+high-variance estimate of the true objective (which averages over all $t$). Per-image, one batch of 128
+covers 128 noise levels. Same compute, far less variance — it's free.
+
+**Return the noise from `q_sample` and use *that* as the target.** Generating fresh noise for the target
+would give the model an impossible task, and it would correctly learn to predict the conditional mean:
+zero. The symptom is a loss that plateaus at exactly 1.0 (the variance of the target), which is a
+useful number to recognise.
+
+**`F.mse_loss` and nothing else.** No adversary, no weighting, no schedule on the loss. The DDPM paper's
+key simplification was dropping the variational bound's per-timestep weights in favour of plain
+unweighted MSE — it works better *and* it's simpler. (Min-SNR weighting later recovered some gains, but
+plain MSE is the right default.)
+
+**AdamW, not SGD.** Diffusion training is a regression problem with no adversarial dynamics, so the
+adaptive optimizer's fast convergence is pure upside. This is the reverse of chapter 4's advice for
+classifiers, and worth noticing: "SGD generalizes better" is a claim about *classification*, not a law.
+
+**What the loss value means.** Predicting zeros scores `Var(eps) = 1.0`. So 0.05 means "we explain 95%
+of the noise variance". The floor is well above zero because at large $t$ the noise genuinely is
+unpredictable — you cannot infer which specific Gaussian sample was drawn. Don't chase 0.
+
+#%% md
+---
+## Task 8 - Sampling
+
+#%% code
+def predict_eps(model, x, t, y=None, guidance=1.0):
+    if y is None:
+        return model(x, t)
+    if guidance == 1.0:
+        return model(x, t, y)
+    null = torch.full_like(y, N_CLASSES)
+    eps_c, eps_u = model(x, t, y), model(x, t, null)
+    return eps_u + guidance * (eps_c - eps_u)
+
+
+@torch.no_grad()
+def ddpm_sample(model, n=16, y=None, guidance=1.0):
+    model.eval()
+    d = diffusion
+    x = torch.randn(n, 1, IMG_SIZE, IMG_SIZE, device=device)
+    for t in reversed(range(d.T)):
+        tt = torch.full((n,), t, device=device, dtype=torch.long)
+        eps = predict_eps(model, x, tt, y, guidance)
+        x = d.sqrt_recip_alphas[t] * (x - d.betas[t] / d.sqrt_1mab[t] * eps)
+        if t > 0:
+            x = x + d.betas[t].sqrt() * torch.randn_like(x)      # no noise on the LAST step
+    return x
+
+
+@torch.no_grad()
+def ddim_sample(model, n=16, steps=50, y=None, guidance=1.0):
+    model.eval()
+    d = diffusion
+    seq = torch.linspace(d.T - 1, 0, steps).long().tolist()
+    x = torch.randn(n, 1, IMG_SIZE, IMG_SIZE, device=device)
+    for i, t in enumerate(seq):
+        tt = torch.full((n,), t, device=device, dtype=torch.long)
+        eps = predict_eps(model, x, tt, y, guidance)
+        ab_t = d.alpha_bars[t]
+        ab_prev = d.alpha_bars[seq[i + 1]] if i + 1 < len(seq) else torch.tensor(1.0, device=device)
+        x0_pred = ((x - (1 - ab_t).sqrt() * eps) / ab_t.sqrt()).clamp(-1, 1)
+        x = ab_prev.sqrt() * x0_pred + (1 - ab_prev).sqrt() * eps
+    return x
+
+
+def pairwise(b):
+    f = b.view(b.size(0), -1)
+    return (torch.cdist(f, f).sum() / (f.size(0) * (f.size(0) - 1))).item()
+
+
+set_seed(0); t0 = time.perf_counter(); s_ddpm = ddpm_sample(model, 32); t_ddpm = time.perf_counter() - t0
+set_seed(0); t0 = time.perf_counter(); s_ddim = ddim_sample(model, 32, 50); t_ddim = time.perf_counter() - t0
+assert pairwise(s_ddpm) > 5.0 and t_ddim < t_ddpm / 3
+print(f'PASS  DDPM {T} steps {t_ddpm:.1f}s (div {pairwise(s_ddpm):.2f}) | '
+      f'DDIM 50 steps {t_ddim:.1f}s (div {pairwise(s_ddim):.2f}) | {t_ddpm / t_ddim:.0f}x faster')
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 5.5))
+for ax, s, ttl in zip(axes, [s_ddpm, s_ddim], [f'DDPM, {T} steps', 'DDIM, 50 steps']):
+    g = make_grid(to_img(s), nrow=8, padding=2)
+    ax.imshow(g.permute(1, 2, 0).numpy(), cmap='gray'); ax.set_title(ttl); ax.axis('off')
+plt.tight_layout()
+
+#%% md
+### Why the samplers look like that
+
+**DDPM: `if t > 0` on the noise.** Adding noise at $t=0$ would leave visible static on your final image
+— you'd be returning $x_{-1}$ with a noise term that never gets denoised. Off-by-one here is very
+common and the symptom is unmistakable once you know it: samples that look right but grainy.
+
+**Why noise is injected at all.** Without it, the reverse process is a deterministic descent toward
+high-density regions, and every sample converges toward the same prototype — chapter 7's MSE-blur
+failure in a different costume. The stochasticity is what makes it *sample* the distribution rather than
+find its mode. The exercise's diversity assertion is exactly this check.
+
+**DDIM's coefficients.** Note what the update does: estimate $\hat{x}_0$ from the current $x_t$ and the
+predicted noise, then **re-noise it to the level of the previous timestep**. Because the step is written
+in terms of $\bar\alpha$ (a function of $t$) rather than $\beta_t$ (a per-step quantity), you can jump
+from $t=399$ to $t=391$ directly — the arithmetic doesn't care that you skipped 7 steps. That's the whole
+trick.
+
+**`ab_prev = 1.0` on the last step** makes $x = \hat{x}_0$ exactly: fully denoised, no noise term.
+
+**`.clamp(-1, 1)` on `x0_pred`.** Not cosmetic. Early in sampling, $\hat{x}_0$ is a wild extrapolation
+(dividing by a tiny $\sqrt{\bar\alpha_t}$) and can land far outside the valid image range. Clamping
+injects the prior "images live in $[-1,1]$", which the network has no other way of knowing. It measurably
+improves samples and it's standard in every real implementation.
+
+**DDIM is deterministic**, so a seed reproduces an image exactly, and interpolating the initial noise
+gives a smooth morph (as in chapter 7). This is what "seed" means in a text-to-image UI, and why DDPM's
+stochastic sampler can't offer it.
+
+**Why DDIM is not simply better.** At very few steps (<20) the discretization error shows up as
+over-smoothing, and stochastic samplers sometimes reach better fidelity given unlimited steps. Modern
+solvers (DPM-Solver, Euler-a, UniPC) are all better ODE integrators for this same learned function.
+
+#%% md
+---
+## Task 9 - Classifier-free guidance
+
+#%% code
+set_seed(0)
+cmodel = TimeUNet(n_classes=N_CLASSES).to(device)
+print(f'training the conditional model, {EPOCHS} epochs, 10% label dropout:')
+chist = train_diffusion(cmodel, EPOCHS, cond=True, p_uncond=0.1)
+assert chist[-1] < 0.06
+print(f'PASS  conditional {chist[0]:.4f} -> {chist[-1]:.4f} | unconditional was {hist[-1]:.4f}')
+
+set_seed(1)
+ys = torch.arange(N_CLASSES, device=device).repeat_interleave(8)
+grid = ddim_sample(cmodel, n=len(ys), steps=50, y=ys, guidance=3.0)
+g = make_grid(to_img(grid), nrow=8, padding=2)
+plt.figure(figsize=(8, 9.5)); plt.imshow(g.permute(1, 2, 0).numpy(), cmap='gray'); plt.axis('off')
+plt.title('conditional DDIM, w=3.0 - row i = class i'); plt.show()
+for i, c in enumerate(CLASSES):
+    print(f'  row {i}: {c}')
+
+#%% code
+ws = [0.0, 1.0, 3.0, 6.0]
+ys_probe = torch.arange(N_CLASSES, device=device)[:9]
+fig, axes = plt.subplots(1, len(ws), figsize=(3 * len(ws), 3.4))
+divs = []
+for ax, w in zip(axes, ws):
+    set_seed(4)
+    s = ddim_sample(cmodel, n=9, steps=50, y=ys_probe, guidance=w)
+    divs.append(pairwise(s))
+    g = make_grid(to_img(s), nrow=3, padding=2)
+    ax.imshow(g.permute(1, 2, 0).numpy(), cmap='gray'); ax.set_title(f'w = {w}'); ax.axis('off')
+plt.suptitle('guidance sweep (same seed, requesting classes 0-8)')
+plt.tight_layout()
+
+print(f'{"w":>5} {"diversity":>11}   note')
+notes = {0.0: 'unconditional - ignores the request entirely',
+         1.0: 'plain conditional',
+         3.0: 'strong - cleaner, more prototypical',
+         6.0: 'over-guided - saturated, less varied'}
+for w, dv in zip(ws, divs):
+    print(f'{w:5.1f} {dv:11.3f}   {notes[w]}')
+
+#%% md
+### What raising the guidance scale trades away
+
+**Diversity, and eventually correctness.**
+
+The mechanism: $\tilde\varepsilon = \varepsilon_u + w(\varepsilon_c - \varepsilon_u)$ is an
+**extrapolation**. The difference $(\varepsilon_c - \varepsilon_u)$ is the direction in noise-space
+that "makes this more of a class $y$"; $w > 1$ walks further along that direction than the model itself
+predicts. So each sampling step is pushed harder toward whatever is most unambiguously class-$y$.
+
+What you get:
+
+- **$w = 0$** — pure unconditional. The label is ignored (only the null token is used), so the class
+  request has no effect at all. Worth generating once to confirm your null token is wired up.
+- **$w = 1$** — the honest conditional model. Maximum diversity, maximum fidelity to the *true*
+  conditional distribution.
+- **$w = 3$–8** — samples get cleaner, sharper and more obviously the requested class. This is the
+  standard operating range, and it is genuinely better by human judgement.
+- **$w > 10$** — saturation. Contrast blows out, images become caricatures, and samples for a given class
+  start collapsing toward one prototype.
+
+The key insight, and the reason this is interesting rather than just a knob: **$w = 1$ is
+distributionally correct, and $w = 3$ looks better.** Guidance deliberately trades
+*distribution-matching* for *sample-level appeal* — it moves mass toward the modes of
+$p(x|y)$ and away from the tails. Formally you're sampling something closer to
+$p(x|y) \cdot \left[\frac{p(x|y)}{p(x)}\right]^{w-1}$, which is a sharpened version of the conditional.
+
+This is the same fidelity-diversity tradeoff FID measured in chapter 7 — except here it's a **sampling
+time** dial rather than a training outcome, so you can move it without retraining. That is a much better
+place for a tradeoff to live, and it is a large part of why diffusion models won.
+
+**Cost:** two forward passes per step instead of one. In practice you batch the conditional and
+unconditional inputs together so it's one pass at double the batch size.
+
+**Why label dropout is needed.** With `p_uncond=0.1`, the same network sees a null token often enough to
+learn a genuine unconditional model, while still spending 90% of its capacity on the conditional task.
+Too low (1%) and the unconditional prediction is unreliable, making guidance unstable; too high (50%) and
+the conditional model suffers. 10-20% is the standard range.
+
+#%% md
+---
+## The course, in five habits
+
+You've now built, from scratch: gradient descent, convolution, a CNN classifier, a fine-tuned transfer
+model, a U-Net segmenter, a GAN, and a diffusion model. The techniques will date. These won't:
+
+1. **Look at your data and your predictions.** Plot them. Most bugs die on contact with a figure — the
+   label-alignment check in chapter 4, the Grad-CAM shortcut in chapter 5, the sample grid in chapter 7.
+2. **Overfit one batch before you train for real.** It separates bugs from tuning, every single time.
+3. **Check identities and gradients numerically.** Chapter 2's finite-difference check, chapter 8's
+   `predict_x0_from_eps` inversion. Seconds to write, hours saved.
+4. **Pick a metric that moves** when the thing you care about improves. Pixel accuracy in chapter 6 and
+   GAN loss in chapter 7 are both examples of metrics that look fine and tell you nothing.
+5. **Ablate.** Every chapter here measured its own claims — augmentation, skip connections, pretraining,
+   guidance. "It should help" is a hypothesis, not a result.
+
+Where to go next is at the end of [`docs/08_diffusion.md`](../../docs/08_diffusion.md).

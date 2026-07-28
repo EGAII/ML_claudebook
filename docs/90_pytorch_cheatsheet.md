@@ -235,3 +235,28 @@ torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 | Dice from IoU | `2*IoU / (1 + IoU)` |
 | float16 max | 65,504 (why `GradScaler` exists) |
 | Typical batch size | 32–256; double batch ⇒ roughly double LR |
+| GAN equilibrium `d_loss` | `2 ln 2` = 1.386, with D accuracy ≈ 0.5 |
+| GAN optimizer | `Adam(2e-4, betas=(0.5, 0.999))`, init `N(0, 0.02)` |
+| Diffusion loss floor | ≪ 1.0 (predicting zeros scores exactly `Var(eps)` = 1.0) |
+| `‖z‖` for `z ~ N(0, I_d)` | ≈ `sqrt(d)` — so slerp, don't lerp |
+| Guidance scale | 1 = true conditional; 3–8 typical; >10 saturates |
+
+## Generative quick reference
+
+```python
+# --- GAN losses (ch 7)
+d_loss = bce(D(real), ones) + bce(D(fake.detach()), zeros)   # detach!
+g_loss = bce(D(fake), ones)                                  # non-saturating
+
+# --- diffusion forward process (ch 8)
+xt = sqrt_ab[t].view(-1,1,1,1) * x0 + sqrt_1mab[t].view(-1,1,1,1) * eps
+loss = F.mse_loss(model(xt, t), eps)                         # t random PER IMAGE
+
+# --- DDPM reverse step
+x = (x - beta[t] / sqrt_1mab[t] * eps) / alpha[t].sqrt()
+if t > 0:
+    x = x + beta[t].sqrt() * torch.randn_like(x)             # no noise at t == 0
+
+# --- classifier-free guidance
+eps = eps_uncond + w * (eps_cond - eps_uncond)
+```

@@ -217,9 +217,10 @@ divisible by 16 so the decoder output won't match the input size — pad to 112 
 
 ---
 
-## You've finished the course
+## End of the discriminative half
 
-What you can now do that you couldn't at the start:
+Chapters 1–6 all had the same shape: an image goes in, a label or a mask comes out, and a ground-truth
+answer tells you how wrong you were. You can now:
 
 - Read a tensor shape and know what every axis means.
 - Write a training loop from memory, and debug one that's silently broken.
@@ -227,20 +228,13 @@ What you can now do that you couldn't at the start:
 - Fine-tune a pretrained model correctly, and check *why* it's right.
 - Build an encoder–decoder with skip connections and evaluate it honestly.
 
-Where to go next, roughly in order of usefulness:
+Chapters 7–8 remove the ground truth. **Generative** modelling asks for a *new* image, so there is
+nothing to subtract your output from — and defining the objective becomes the entire problem. Two
+very different answers to that:
 
-1. **Object detection** — the third core task. Start with the concepts (anchors, NMS, IoU
-   matching), then use a library (`torchvision`'s Faster R-CNN, or Ultralytics YOLO).
-2. **Vision transformers** — how attention replaces convolution's built-in locality, and why they
-   need more data.
-3. **Self-supervised learning** — SimCLR, DINO, MAE: pretraining without labels, which is how
-   modern backbones are actually made.
-4. **Deployment** — `torch.compile`, ONNX export, quantization, TensorRT. Very different skills, and
-   the ones that make your model useful to anyone else.
-5. **Generative vision** — diffusion models, which is where the U-Net you just built shows up again
-   as the core denoising network. Your work here is not wasted.
+- [**Chapter 7 — GANs**](07_gans.md): if you can't write the loss, *learn* it, as a second network.
+- [**Chapter 8 — Diffusion**](08_diffusion.md): reframe generation as denoising, which makes the loss
+  a plain MSE — and reuses the U-Net you just built as its backbone. That closing remark about
+  diffusion was not a throwaway line; the architecture transfers almost unchanged.
 
-Two habits to keep from this course, above any specific technique:
-
-- **Look at your data and your predictions.** Plot them. Most bugs die on contact with a figure.
-- **Overfit one batch before you train for real.** It separates bugs from tuning, every time.
+Next: [Chapter 7 — GANs](07_gans.md)

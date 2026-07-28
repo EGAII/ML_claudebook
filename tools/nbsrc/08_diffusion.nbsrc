@@ -1,0 +1,718 @@
+#out notebooks/08_diffusion_ddpm.ipynb
+#gpu on
+
+#%% md
+# Chapter 8 - Diffusion models: generation as denoising
+
+Companion to [`docs/08_diffusion.md`](../docs/08_diffusion.md).
+
+> **GPU: Runtime -> Change runtime type -> T4 GPU.** About 8 minutes total.
+
+This is where chapter 6's U-Net becomes a generative model. We build DDPM from scratch on MNIST:
+
+1. The **forward process** - and verify the closed form against the iterative definition.
+2. **Noise schedules**, linear vs cosine, and why the choice matters.
+3. A **time-conditioned U-Net**: chapter 6's architecture plus sinusoidal timestep embeddings.
+4. Training - whose loss is `F.mse_loss` and **actually goes down**, unlike chapter 7.
+5. **DDPM sampling** (every step) and **DDIM sampling** (skipping steps, 20x faster).
+6. **Classifier-free guidance** - the slider in every text-to-image tool.
+
+#%% code
+import sys, time, math
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
+from torchvision.utils import make_grid
+
+print('torch', torch.__version__)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+if device.type != 'cuda':
+    print('\n*** NO GPU: Runtime -> Change runtime type -> T4 GPU, then Restart. ***')
+    print('On CPU, reduce EPOCHS to 2-3 and T to 200.')
+print('device', device)
+
+try:
+    import google.colab  # noqa: F401
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+DATA_DIR = '/content/data' if IN_COLAB else './data'
+NUM_WORKERS = 2 if IN_COLAB else 0
+
+def set_seed(seed=0):
+    import random
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+set_seed(0)
+torch.backends.cudnn.benchmark = True
+plt.rcParams['figure.dpi'] = 110
+
+IMG_SIZE = 32
+N_CLASSES = 10
+T = 400                 # 1000 in the paper; 400 is plenty at 32x32 and 2.5x faster to sample
+
+tf = transforms.Compose([
+    transforms.Resize(IMG_SIZE),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,), (0.5,)),        # -> [-1, 1], the range diffusion assumes
+])
+full_ds = datasets.MNIST(DATA_DIR, train=True, download=True, transform=tf)
+train_ds = Subset(full_ds, range(16000))          # a subset keeps this notebook to ~8 minutes
+loader = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=NUM_WORKERS,
+                    pin_memory=device.type == 'cuda', drop_last=True)
+
+def to_img(t):
+    return ((t.detach().cpu() + 1) / 2).clamp(0, 1)
+
+def show_grid(t, nrow=8, title='', figsize=(7, 7)):
+    g = make_grid(to_img(t), nrow=nrow, padding=2)
+    plt.figure(figsize=figsize); plt.imshow(g.permute(1, 2, 0).numpy(), cmap='gray')
+    plt.axis('off'); plt.title(title); plt.show()
+
+xb, yb = next(iter(loader))
+print(f'{len(train_ds)} images | {len(loader)} batches | batch {tuple(xb.shape)} in ({xb.min():.2f}, {xb.max():.2f})')
+print(f'T = {T} diffusion steps')
+
+#%% md
+## 1. Noise schedules
+
+$\beta_t$ says how much noise to add at step $t$. From it:
+$\alpha_t = 1 - \beta_t$ and $\bar\alpha_t = \prod_{s \le t}\alpha_s$.
+
+$\bar\alpha_t$ is the one that matters - it's the signal-to-noise ratio at step $t$, and it appears
+directly in the closed form.
+
+#%% code
+def linear_schedule(T, beta_start=1e-4, beta_end=0.02):
+    return torch.linspace(beta_start, beta_end, T)
+
+def cosine_schedule(T, s=0.008):
+    """Improved-DDPM cosine schedule: defines alpha_bar first, then derives beta."""
+    steps = torch.arange(T + 1, dtype=torch.float64) / T
+    ab = torch.cos((steps + s) / (1 + s) * math.pi / 2) ** 2
+    ab = ab / ab[0]
+    betas = 1 - (ab[1:] / ab[:-1])
+    return betas.clamp(0, 0.999).float()
+
+
+class Diffusion:
+    """Holds a schedule and every derived constant, precomputed on the right device."""
+
+    def __init__(self, betas, device):
+        self.T = len(betas)
+        self.betas = betas.to(device)
+        self.alphas = 1.0 - self.betas
+        self.alpha_bars = torch.cumprod(self.alphas, dim=0)
+        self.sqrt_ab = self.alpha_bars.sqrt()
+        self.sqrt_1mab = (1.0 - self.alpha_bars).sqrt()
+        self.sqrt_recip_alphas = (1.0 / self.alphas).sqrt()
+
+    def q_sample(self, x0, t, noise=None):
+        """The closed form: x_t = sqrt(ab_t) x_0 + sqrt(1 - ab_t) eps. No loop, any t."""
+        if noise is None:
+            noise = torch.randn_like(x0)
+        ab = self.sqrt_ab[t].view(-1, 1, 1, 1)          # (B,) -> (B,1,1,1) to broadcast over CHW
+        om = self.sqrt_1mab[t].view(-1, 1, 1, 1)
+        return ab * x0 + om * noise, noise
+
+
+diff_lin = Diffusion(linear_schedule(T), device)
+diff_cos = Diffusion(cosine_schedule(T), device)
+
+fig, axes = plt.subplots(1, 3, figsize=(13, 3.2))
+axes[0].plot(diff_lin.betas.cpu(), label='linear'); axes[0].plot(diff_cos.betas.cpu(), label='cosine')
+axes[0].set_title('beta_t (noise added per step)'); axes[0].set_xlabel('t')
+axes[1].plot(diff_lin.alpha_bars.cpu(), label='linear'); axes[1].plot(diff_cos.alpha_bars.cpu(), label='cosine')
+axes[1].set_title('alpha_bar_t (signal remaining)'); axes[1].set_xlabel('t')
+snr_lin = diff_lin.alpha_bars / (1 - diff_lin.alpha_bars)
+snr_cos = diff_cos.alpha_bars / (1 - diff_cos.alpha_bars)
+axes[2].plot(snr_lin.cpu(), label='linear'); axes[2].plot(snr_cos.cpu(), label='cosine')
+axes[2].set_yscale('log'); axes[2].set_title('signal-to-noise ratio (log)'); axes[2].set_xlabel('t')
+for ax in axes:
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+plt.tight_layout()
+
+print(f'{"t":>5} {"linear ab":>11} {"cosine ab":>11}')
+for t in [0, T // 8, T // 4, T // 2, 3 * T // 4, T - 1]:
+    print(f'{t:5d} {diff_lin.alpha_bars[t]:11.4f} {diff_cos.alpha_bars[t]:11.4f}')
+print(f'\nlinear reaches ab < 0.1 at t = {int((diff_lin.alpha_bars < 0.1).nonzero()[0])}'
+      f' of {T} ({100 * int((diff_lin.alpha_bars < 0.1).nonzero()[0]) / T:.0f}% through)')
+print(f'cosine reaches ab < 0.1 at t = {int((diff_cos.alpha_bars < 0.1).nonzero()[0])}'
+      f' of {T} ({100 * int((diff_cos.alpha_bars < 0.1).nonzero()[0]) / T:.0f}% through)')
+print('\nThe linear schedule destroys the image early and then spends its remaining steps')
+print('denoising almost-pure noise, which teaches the model little. Cosine keeps signal alive')
+print('longer, so more steps land in the informative middle. We use cosine below.')
+
+#%% md
+## 2. The forward process, seen and verified
+
+#%% code
+x0 = xb[:1].to(device)
+ts_show = [0, T // 16, T // 8, T // 4, T // 2, 3 * T // 4, T - 1]
+
+fig, axes = plt.subplots(2, len(ts_show), figsize=(2 * len(ts_show), 4.4))
+for col, t in enumerate(ts_show):
+    tt = torch.full((1,), t, device=device, dtype=torch.long)
+    for row, (d, name) in enumerate([(diff_lin, 'linear'), (diff_cos, 'cosine')]):
+        set_seed(7)                                          # same noise, fair comparison
+        xt, _ = d.q_sample(x0, tt)
+        axes[row, col].imshow(to_img(xt)[0, 0].numpy(), cmap='gray')
+        axes[row, col].set_title(f't={t}\nab={d.alpha_bars[t]:.3f}', fontsize=8)
+        axes[row, col].axis('off')
+axes[0, 0].set_ylabel('linear'); axes[1, 0].set_ylabel('cosine')
+plt.suptitle('forward diffusion: top = linear schedule, bottom = cosine (same noise)')
+plt.tight_layout()
+print('At the halfway point the cosine version is still recognisably a digit while the linear')
+print('one is nearly gone. That difference is the schedule doing its job.')
+
+#%% code
+print('verifying the closed form against the iterative definition\n')
+set_seed(0)
+d = diff_cos
+x_iter = x0.clone()
+target_t = 60
+for t in range(target_t + 1):
+    noise = torch.randn_like(x_iter)
+    x_iter = d.alphas[t].sqrt() * x_iter + d.betas[t].sqrt() * noise      # one step of q(x_t|x_{t-1})
+
+print(f'after {target_t + 1} iterative steps:  mean {x_iter.mean():+.4f}  std {x_iter.std():.4f}')
+xt_closed, _ = d.q_sample(x0.repeat(256, 1, 1, 1),
+                          torch.full((256,), target_t, device=device, dtype=torch.long))
+print(f'closed form (256 draws):        mean {xt_closed.mean():+.4f}  std {xt_closed.std():.4f}')
+print('\nThese are two draws from the SAME distribution, not the same sample - so the statistics')
+print('match while the pixels do not. That is the whole point: composing Gaussians gives a')
+print('Gaussian, so we can jump to any t in one line instead of looping t times.')
+
+print('\nand as t -> T the distribution converges to N(0, I):')
+probe = xb.to(device)
+nb_probe = probe.size(0)
+for t in [0, T // 4, T // 2, T - 1]:
+    xt, _ = d.q_sample(probe, torch.full((nb_probe,), t, device=device, dtype=torch.long))
+    print(f'  t={t:4d}  mean {xt.mean():+.4f}  std {xt.std():.4f}')
+print('  target       mean +0.0000  std 1.0000')
+
+#%% md
+## 3. Time embeddings
+
+The network must know **how much** noise to remove, so $t$ has to be an input. A bare scalar is far
+too weak a signal to distinguish 400 levels, so we use sinusoidal features at many frequencies - the
+same encoding transformers use for position.
+
+#%% code
+def timestep_embedding(t, dim):
+    """(B,) integer timesteps -> (B, dim) sinusoidal features."""
+    half = dim // 2
+    freqs = torch.exp(-math.log(10000) * torch.arange(half, device=t.device).float() / half)
+    args = t[:, None].float() * freqs[None]
+    return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+
+
+emb = timestep_embedding(torch.arange(T, device=device), 128)
+print('embedding matrix', tuple(emb.shape), '= (T, dim)')
+
+fig, axes = plt.subplots(1, 3, figsize=(13, 3.2))
+im = axes[0].imshow(emb.cpu().T.numpy(), aspect='auto', cmap='RdBu_r')
+axes[0].set_xlabel('t'); axes[0].set_ylabel('embedding dim'); axes[0].set_title('sinusoidal embeddings')
+plt.colorbar(im, ax=axes[0], shrink=0.8)
+for t in [0, 50, 200, 399]:
+    axes[1].plot(emb[t].cpu().numpy(), label=f't={t}', alpha=0.8)
+axes[1].set_title('a few individual embeddings'); axes[1].legend(fontsize=7); axes[1].set_xlabel('dim')
+sim = (F.normalize(emb, dim=1) @ F.normalize(emb, dim=1).T).cpu().numpy()
+im2 = axes[2].imshow(sim, cmap='viridis'); axes[2].set_title('cosine similarity between timesteps')
+axes[2].set_xlabel('t'); axes[2].set_ylabel('t'); plt.colorbar(im2, ax=axes[2], shrink=0.8)
+plt.tight_layout()
+
+print('The similarity matrix is what makes this a good code: nearby timesteps have similar')
+print('embeddings (smooth, so the network generalizes across noise levels) while distant ones are')
+print('nearly orthogonal (distinguishable). A single scalar t would give the network almost no')
+print('capacity to behave differently at t=50 versus t=200.')
+
+#%% md
+## 4. The time-conditioned U-Net
+
+Chapter 6's U-Net with three changes: **residual blocks** instead of plain double-convs,
+**GroupNorm** instead of BatchNorm (batch-size independent), and a **time embedding added to every
+block's features**. Plus self-attention at the lowest resolution for global coherence.
+
+#%% code
+class ResBlock(nn.Module):
+    """GroupNorm -> SiLU -> conv, inject time, GroupNorm -> SiLU -> conv, plus a skip."""
+
+    def __init__(self, c_in, c_out, t_dim, groups=8):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(groups, c_in)
+        self.conv1 = nn.Conv2d(c_in, c_out, 3, padding=1)
+        self.t_proj = nn.Linear(t_dim, c_out)                # time -> per-channel shift
+        self.norm2 = nn.GroupNorm(groups, c_out)
+        self.conv2 = nn.Conv2d(c_out, c_out, 3, padding=1)
+        self.skip = nn.Conv2d(c_in, c_out, 1) if c_in != c_out else nn.Identity()
+
+    def forward(self, x, t_emb):
+        h = self.conv1(F.silu(self.norm1(x)))
+        h = h + self.t_proj(F.silu(t_emb))[:, :, None, None]  # broadcast (B,C) over H, W
+        h = self.conv2(F.silu(self.norm2(h)))
+        return h + self.skip(x)
+
+
+class SelfAttention(nn.Module):
+    """Single-head self-attention over spatial positions. Cheap at 8x8, essential at high res."""
+
+    def __init__(self, c, groups=8):
+        super().__init__()
+        self.norm = nn.GroupNorm(groups, c)
+        self.qkv = nn.Conv2d(c, c * 3, 1)
+        self.proj = nn.Conv2d(c, c, 1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        q, k, v = self.qkv(self.norm(x)).reshape(B, 3, C, H * W).unbind(1)
+        attn = torch.softmax(q.transpose(1, 2) @ k / math.sqrt(C), dim=-1)   # (B, HW, HW)
+        out = (v @ attn.transpose(1, 2)).reshape(B, C, H, W)
+        return x + self.proj(out)
+
+
+class Up(nn.Module):
+    def __init__(self, c_in, c_out):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode='nearest')
+        self.conv = nn.Conv2d(c_in, c_out, 3, padding=1)
+
+    def forward(self, x):
+        return self.conv(self.up(x))
+
+
+class TimeUNet(nn.Module):
+    """32 -> 16 -> 8 -> 16 -> 32, with skips. Optionally class-conditional."""
+
+    def __init__(self, c_in=1, base=32, t_dim=128, n_classes=None):
+        super().__init__()
+        self.t_dim = t_dim
+        self.time_mlp = nn.Sequential(nn.Linear(t_dim, t_dim), nn.SiLU(), nn.Linear(t_dim, t_dim))
+        # n_classes + 1: the extra slot is the NULL label used by classifier-free guidance
+        self.class_emb = nn.Embedding(n_classes + 1, t_dim) if n_classes else None
+
+        b = base
+        self.stem = nn.Conv2d(c_in, b, 3, padding=1)
+        self.rb1 = ResBlock(b, b, t_dim)
+        self.down1 = nn.Conv2d(b, b, 3, stride=2, padding=1)          # 32 -> 16
+        self.rb2 = ResBlock(b, 2 * b, t_dim)
+        self.down2 = nn.Conv2d(2 * b, 2 * b, 3, stride=2, padding=1)  # 16 -> 8
+        self.mid1 = ResBlock(2 * b, 2 * b, t_dim)
+        self.attn = SelfAttention(2 * b)
+        self.mid2 = ResBlock(2 * b, 2 * b, t_dim)
+        self.up2 = Up(2 * b, 2 * b)                                    # 8 -> 16
+        self.rb3 = ResBlock(4 * b, 2 * b, t_dim)                       # cat with rb2 output
+        self.up1 = Up(2 * b, b)                                        # 16 -> 32
+        self.rb4 = ResBlock(2 * b, b, t_dim)                           # cat with rb1 output
+        self.out = nn.Sequential(nn.GroupNorm(8, b), nn.SiLU(), nn.Conv2d(b, c_in, 3, padding=1))
+
+    def forward(self, x, t, y=None):
+        t_emb = self.time_mlp(timestep_embedding(t, self.t_dim))
+        if self.class_emb is not None:
+            assert y is not None, 'this model is conditional - pass y (use N_CLASSES for null)'
+            t_emb = t_emb + self.class_emb(y)                          # conditioning: just add it
+
+        h1 = self.rb1(self.stem(x), t_emb)                             # (B, b, 32, 32)
+        h2 = self.rb2(self.down1(h1), t_emb)                           # (B, 2b, 16, 16)
+        m = self.mid2(self.attn(self.mid1(self.down2(h2), t_emb)), t_emb)   # (B, 2b, 8, 8)
+        u = self.rb3(torch.cat([self.up2(m), h2], dim=1), t_emb)       # (B, 2b, 16, 16)
+        u = self.rb4(torch.cat([self.up1(u), h1], dim=1), t_emb)       # (B, b, 32, 32)
+        return self.out(u)                                             # predicted NOISE, same shape as x
+
+
+model = TimeUNet().to(device)
+print(f'parameters: {sum(p.numel() for p in model.parameters()):,}')
+
+x_test = torch.randn(2, 1, 32, 32, device=device)
+t_test = torch.randint(0, T, (2,), device=device)
+with torch.no_grad():
+    out = model(x_test, t_test)
+print(f'input {tuple(x_test.shape)} + t {tuple(t_test.shape)} -> output {tuple(out.shape)}')
+assert out.shape == x_test.shape, 'the network predicts noise, so output shape == input shape'
+
+print('\nthe timestep genuinely changes the output (it had better):')
+with torch.no_grad():
+    o_a = model(x_test, torch.zeros(2, dtype=torch.long, device=device))
+    o_b = model(x_test, torch.full((2,), T - 1, dtype=torch.long, device=device))
+print(f'  ||f(x, t=0) - f(x, t={T - 1})|| = {(o_a - o_b).norm():.3f}  (nonzero -> t is being used)')
+
+#%% md
+## 5. Training
+
+The entire algorithm, six lines. Note the loss is `F.mse_loss` — this is **regression**, not
+adversarial anything.
+
+#%% code
+diffusion = diff_cos
+
+def train_diffusion(model, epochs, lr=2e-4, cond=False, p_uncond=0.1, log_every=1):
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    hist = []
+    for ep in range(epochs):
+        t0 = time.perf_counter()
+        model.train()
+        tot, n = 0.0, 0
+        for x0, y in loader:
+            x0 = x0.to(device, non_blocking=True)
+            t = torch.randint(0, T, (x0.size(0),), device=device)      # random t PER IMAGE
+            xt, noise = diffusion.q_sample(x0, t)                      # the closed form
+
+            if cond:
+                y = y.to(device, non_blocking=True)
+                # randomly replace the label with the null token: this is what lets ONE network
+                # provide both the conditional and unconditional prediction for guidance
+                drop = torch.rand(y.shape, device=device) < p_uncond
+                y = torch.where(drop, torch.full_like(y, N_CLASSES), y)
+                pred = model(xt, t, y)
+            else:
+                pred = model(xt, t)
+
+            loss = F.mse_loss(pred, noise)                             # predict the noise. That is all.
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            tot += loss.item() * x0.size(0); n += x0.size(0)
+        sched.step()
+        hist.append(tot / n)
+        if ep % log_every == 0 or ep == epochs - 1:
+            print(f'  epoch {ep:3d}  loss {hist[-1]:.4f}  {time.perf_counter() - t0:5.1f}s')
+    return hist
+
+
+EPOCHS = 18
+set_seed(0)
+model = TimeUNet().to(device)
+print(f'training {EPOCHS} epochs on {len(train_ds)} images:')
+t_start = time.perf_counter()
+hist = train_diffusion(model, EPOCHS)
+print(f'\ntotal {(time.perf_counter() - t_start) / 60:.1f} min | final loss {hist[-1]:.4f}')
+
+plt.figure(figsize=(5.5, 3.2))
+plt.plot(hist, marker='.'); plt.xlabel('epoch'); plt.ylabel('MSE on the noise')
+plt.title('diffusion loss: it just goes down'); plt.grid(alpha=0.3)
+print('\nCompare with chapter 7, where the loss told you nothing. Here the loss is a real')
+print('training signal, because the target is known and fixed. That single difference is why')
+print('diffusion models replaced GANs for image generation.')
+
+#%% md
+### What the loss value means
+
+An untrained network predicting zeros would score `mse_loss(0, eps) = Var(eps) = 1.0`. So the loss is
+"fraction of the noise variance we failed to explain", and the floor is well above 0: at large $t$ the
+input really is almost pure noise, and the noise is genuinely unpredictable. A loss around 0.03-0.05
+is healthy here.
+
+#%% code
+print('per-timestep loss - where is the model good and where is it hopeless?\n')
+model.eval()
+x0_probe, _ = next(iter(loader))
+x0_probe = x0_probe.to(device)
+n_probe = x0_probe.size(0)
+buckets = []
+with torch.no_grad():
+    for t_val in range(0, T, T // 10):
+        t = torch.full((n_probe,), t_val, device=device, dtype=torch.long)
+        set_seed(1)
+        xt, noise = diffusion.q_sample(x0_probe, t)
+        buckets.append((t_val, F.mse_loss(model(xt, t), noise).item()))
+
+for t_val, l in buckets:
+    bar = '#' * int(l * 200)
+    print(f'  t={t_val:4d}  ab={diffusion.alpha_bars[t_val]:.3f}  loss {l:.4f}  {bar}')
+print('\nHardest at SMALL t: when the image is barely noisy, the little noise that is there is')
+print('almost impossible to pin down exactly. Easiest at large t, where the model can predict')
+print('"it is nearly all noise" and be mostly right. Sampling quality is dominated by the small-t')
+print('end - which is why weighted objectives and min-SNR loss weighting are active research.')
+
+#%% md
+## 6. DDPM sampling
+
+Start from pure noise and step all the way down, adding a little fresh noise at each step (except
+the last).
+
+#%% code
+@torch.no_grad()
+def ddpm_sample(model, n=16, d=None, keep=None, y=None, guidance=1.0):
+    """Full reverse process. Returns (final images, [snapshots])."""
+    d = d or diffusion
+    model.eval()
+    x = torch.randn(n, 1, IMG_SIZE, IMG_SIZE, device=device)
+    keep = set(keep or [])
+    snaps = []
+    for t in reversed(range(d.T)):
+        tt = torch.full((n,), t, device=device, dtype=torch.long)
+        eps = predict_eps(model, x, tt, y, guidance)
+        # mean of p(x_{t-1} | x_t)
+        x = d.sqrt_recip_alphas[t] * (x - d.betas[t] / d.sqrt_1mab[t] * eps)
+        if t > 0:
+            x = x + d.betas[t].sqrt() * torch.randn_like(x)     # no noise on the final step
+        if t in keep:
+            snaps.append(x.clone().cpu())
+    return x, snaps
+
+
+def predict_eps(model, x, t, y=None, guidance=1.0):
+    """Noise prediction, with optional classifier-free guidance."""
+    if y is None:
+        return model(x, t)
+    if guidance == 1.0:
+        return model(x, t, y)
+    null = torch.full_like(y, N_CLASSES)
+    eps_c = model(x, t, y)
+    eps_u = model(x, t, null)
+    return eps_u + guidance * (eps_c - eps_u)                   # extrapolate away from unconditional
+
+
+set_seed(0)
+t0 = time.perf_counter()
+snap_at = [T - 1, int(T * 0.75), int(T * 0.5), int(T * 0.25), int(T * 0.1), 0]
+samples, snaps = ddpm_sample(model, n=64, keep=snap_at)
+print(f'DDPM sampling: {T} forward passes for 64 images in {time.perf_counter() - t0:.1f}s')
+
+show_grid(samples, nrow=8, title=f'64 DDPM samples ({T} steps)', figsize=(7, 7))
+
+fig, axes = plt.subplots(1, len(snaps), figsize=(2.2 * len(snaps), 2.6))
+for ax, s, t_val in zip(axes, snaps, sorted(snap_at, reverse=True)):
+    g = make_grid(to_img(s[:9]), nrow=3, padding=1)
+    ax.imshow(g.permute(1, 2, 0).numpy(), cmap='gray')
+    ax.set_title(f't={t_val}', fontsize=9); ax.axis('off')
+plt.suptitle('the reverse process: noise (left) -> images (right)')
+plt.tight_layout()
+
+#%% code
+print('what happens WITHOUT the injected noise during sampling?\n')
+
+@torch.no_grad()
+def ddpm_sample_no_noise(model, n=16, d=None):
+    d = d or diffusion
+    model.eval()
+    x = torch.randn(n, 1, IMG_SIZE, IMG_SIZE, device=device)
+    for t in reversed(range(d.T)):
+        tt = torch.full((n,), t, device=device, dtype=torch.long)
+        eps = model(x, tt)
+        x = d.sqrt_recip_alphas[t] * (x - d.betas[t] / d.sqrt_1mab[t] * eps)
+    return x
+
+set_seed(0)
+no_noise = ddpm_sample_no_noise(model, n=16)
+set_seed(0)
+with_noise, _ = ddpm_sample(model, n=16)
+
+def pairwise(b):
+    f = b.view(b.size(0), -1)
+    return (torch.cdist(f, f).sum() / (f.size(0) * (f.size(0) - 1))).item()
+
+print(f'with injected noise: pairwise sample distance {pairwise(with_noise):.3f}')
+print(f'without:             pairwise sample distance {pairwise(no_noise):.3f}')
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+for ax, b, ttl in zip(axes, [with_noise, no_noise], ['with injected noise (correct)', 'without (collapses)']):
+    g = make_grid(to_img(b), nrow=4, padding=2)
+    ax.imshow(g.permute(1, 2, 0).numpy(), cmap='gray'); ax.set_title(ttl); ax.axis('off')
+plt.tight_layout()
+print('\nWithout the noise term the sampler walks deterministically toward high-density regions')
+print('and every sample looks similar and over-smoothed - the same failure as the MSE generator')
+print('in chapter 7. The stochasticity is what makes it sample the distribution rather than')
+print('find its mode.')
+
+#%% md
+## 7. DDIM: the same model, 20x fewer steps
+
+DDIM rewrites the reverse step deterministically, which means you can **skip timesteps**. No
+retraining - it's the same network.
+
+#%% code
+@torch.no_grad()
+def ddim_sample(model, n=16, steps=50, d=None, y=None, guidance=1.0, eta=0.0):
+    """Deterministic (eta=0) sampling on a subsequence of timesteps."""
+    d = d or diffusion
+    model.eval()
+    seq = torch.linspace(d.T - 1, 0, steps).long().tolist()          # e.g. 399, 391, ..., 0
+    x = torch.randn(n, 1, IMG_SIZE, IMG_SIZE, device=device)
+    for i, t in enumerate(seq):
+        tt = torch.full((n,), t, device=device, dtype=torch.long)
+        eps = predict_eps(model, x, tt, y, guidance)
+        ab_t = d.alpha_bars[t]
+        ab_prev = d.alpha_bars[seq[i + 1]] if i + 1 < len(seq) else torch.tensor(1.0, device=device)
+        x0_pred = (x - (1 - ab_t).sqrt() * eps) / ab_t.sqrt()         # implied clean image
+        x0_pred = x0_pred.clamp(-1, 1)                                # clipping helps in practice
+        x = ab_prev.sqrt() * x0_pred + (1 - ab_prev).sqrt() * eps
+    return x
+
+
+print(f'{"sampler":18} {"steps":>6} {"time":>8}  pairwise diversity')
+set_seed(0); t0 = time.perf_counter(); s_ddpm, _ = ddpm_sample(model, 64)
+print(f'{"DDPM":18} {T:6d} {time.perf_counter() - t0:7.1f}s  {pairwise(s_ddpm):.3f}')
+results = {'DDPM': s_ddpm}
+for steps in [100, 50, 20, 10]:
+    set_seed(0); t0 = time.perf_counter()
+    s = ddim_sample(model, 64, steps=steps)
+    print(f'{"DDIM":18} {steps:6d} {time.perf_counter() - t0:7.1f}s  {pairwise(s):.3f}')
+    results[f'DDIM {steps}'] = s
+
+fig, axes = plt.subplots(1, len(results), figsize=(3.1 * len(results), 3.4))
+for ax, (name, s) in zip(axes, results.items()):
+    g = make_grid(to_img(s[:16]), nrow=4, padding=2)
+    ax.imshow(g.permute(1, 2, 0).numpy(), cmap='gray'); ax.set_title(name, fontsize=10); ax.axis('off')
+plt.suptitle('same trained model, different samplers')
+plt.tight_layout()
+print('\n50 DDIM steps is usually indistinguishable from 400 DDPM steps. At 10 steps the digits')
+print('get smoother and a few break down. This tradeoff is exactly the "sampling steps" slider')
+print('in every diffusion tool, and modern solvers (DPM-Solver, Euler-a) push it to 10-20.')
+
+#%% md
+## 8. Conditional generation and classifier-free guidance
+
+Train a class-conditional model, dropping the label 10% of the time so the same network also learns
+the unconditional prediction. Then at sampling time:
+
+$$\tilde\varepsilon = \varepsilon_\theta(x_t, t, \varnothing) + w\big(\varepsilon_\theta(x_t, t, y) - \varepsilon_\theta(x_t, t, \varnothing)\big)$$
+
+#%% code
+set_seed(0)
+cmodel = TimeUNet(n_classes=N_CLASSES).to(device)
+print(f'conditional model: {sum(p.numel() for p in cmodel.parameters()):,} parameters')
+print(f'(class embedding has {N_CLASSES + 1} slots - the last one is the null token)\n')
+print(f'training {EPOCHS} epochs with 10% label dropout:')
+chist = train_diffusion(cmodel, EPOCHS, cond=True, p_uncond=0.1, log_every=3)
+
+plt.figure(figsize=(5.5, 3.2))
+plt.plot(hist, marker='.', label='unconditional')
+plt.plot(chist, marker='.', label='conditional')
+plt.xlabel('epoch'); plt.ylabel('MSE'); plt.legend(); plt.grid(alpha=0.3)
+plt.title('conditioning makes the task easier')
+print(f'\nfinal loss: unconditional {hist[-1]:.4f} | conditional {chist[-1]:.4f}')
+print('The conditional model has strictly more information, so it predicts the noise better.')
+
+#%% code
+set_seed(1)
+ys = torch.arange(N_CLASSES, device=device).repeat_interleave(8)
+samples_c = ddim_sample(cmodel, n=len(ys), steps=50, y=ys, guidance=3.0)
+
+g = make_grid(to_img(samples_c), nrow=8, padding=2)
+plt.figure(figsize=(8, 9.5))
+plt.imshow(g.permute(1, 2, 0).numpy(), cmap='gray'); plt.axis('off')
+plt.title('conditional DDIM, guidance w=3.0\nrow i = requested digit i')
+plt.show()
+
+#%% code
+print('sweeping the guidance scale on a fixed set of requests and seeds\n')
+ws = [0.0, 1.0, 2.0, 4.0, 8.0]
+fig, axes = plt.subplots(1, len(ws), figsize=(2.8 * len(ws), 3.2))
+ys_probe = torch.arange(N_CLASSES, device=device)[:9]
+divs = []
+for ax, w in zip(axes, ws):
+    set_seed(4)
+    s = ddim_sample(cmodel, n=9, steps=50, y=ys_probe, guidance=w)
+    divs.append(pairwise(s))
+    g = make_grid(to_img(s), nrow=3, padding=2)
+    ax.imshow(g.permute(1, 2, 0).numpy(), cmap='gray')
+    ax.set_title(f'w = {w}', fontsize=10); ax.axis('off')
+plt.suptitle('classifier-free guidance scale (requests are digits 0-8, same seed)')
+plt.tight_layout()
+
+print(f'{"w":>5}  {"diversity":>10}   interpretation')
+for w, dv in zip(ws, divs):
+    note = {0.0: 'unconditional - ignores the request entirely',
+            1.0: 'plain conditional',
+            2.0: 'mild guidance',
+            4.0: 'strong - cleaner, more prototypical',
+            8.0: 'too strong - saturated, less varied'}.get(w, '')
+    print(f'{w:5.1f}  {dv:10.3f}   {note}')
+print('\nw=0 uses only the null token, so the digits are random regardless of what we asked for.')
+print('Increasing w makes samples more obedient and more prototypical, and less diverse. That is')
+print('the fidelity-diversity tradeoff, exposed as a single slider - the "CFG scale" in every')
+print('text-to-image tool. Typical production values are 3-8.')
+
+#%% code
+print('DDIM is deterministic, so latent interpolation works exactly as in chapter 7:\n')
+set_seed(11)
+
+@torch.no_grad()
+def ddim_from_noise(model, x_init, steps=50, y=None, guidance=1.0, d=None):
+    d = d or diffusion
+    model.eval()
+    seq = torch.linspace(d.T - 1, 0, steps).long().tolist()
+    x = x_init.clone()
+    for i, t in enumerate(seq):
+        tt = torch.full((x.size(0),), t, device=device, dtype=torch.long)
+        eps = predict_eps(model, x, tt, y, guidance)
+        ab_t = d.alpha_bars[t]
+        ab_prev = d.alpha_bars[seq[i + 1]] if i + 1 < len(seq) else torch.tensor(1.0, device=device)
+        x0_pred = ((x - (1 - ab_t).sqrt() * eps) / ab_t.sqrt()).clamp(-1, 1)
+        x = ab_prev.sqrt() * x0_pred + (1 - ab_prev).sqrt() * eps
+    return x
+
+za = torch.randn(1, 1, IMG_SIZE, IMG_SIZE, device=device)
+zb = torch.randn(1, 1, IMG_SIZE, IMG_SIZE, device=device)
+ts_i = torch.linspace(0, 1, 10, device=device).view(-1, 1, 1, 1)
+# slerp, for the same high-dimensional reason as chapter 7
+fa, fb = za.flatten(), zb.flatten()
+omega = torch.acos((fa / fa.norm() * (fb / fb.norm())).sum().clamp(-1, 1))
+zs = (torch.sin((1 - ts_i) * omega) * za + torch.sin(ts_i * omega) * zb) / torch.sin(omega)
+
+imgs = ddim_from_noise(cmodel, zs, steps=50,
+                       y=torch.full((10,), 3, device=device, dtype=torch.long), guidance=3.0)
+fig, axes = plt.subplots(1, 10, figsize=(13, 1.8))
+for ax, im in zip(axes, imgs):
+    ax.imshow(to_img(im)[0].numpy(), cmap='gray'); ax.axis('off')
+plt.suptitle('interpolating the initial NOISE with the class fixed to "3" (deterministic DDIM)')
+plt.tight_layout()
+print('The class is held constant and only the seed moves, so every frame is a 3 - drawn')
+print('differently. Label = what, noise = how. Same factorization as the conditional GAN.')
+
+#%% md
+## 9. Diffusion vs GAN, having now built both
+
+#%% code
+print(f'{"":26} {"GAN (ch 7)":>22} {"Diffusion (ch 8)":>22}')
+rows = [
+    ('networks to train', '2 (adversarial)', '1'),
+    ('loss', 'learned, adversarial', 'MSE on noise'),
+    ('loss curve informative?', 'no', 'yes'),
+    ('training stability', 'delicate', 'boring'),
+    ('hyperparameter sensitivity', 'high', 'low'),
+    ('mode coverage', 'drops modes', 'covers'),
+    ('sampling cost', '1 forward pass', f'{T} (or ~50 DDIM)'),
+    ('conditioning', 'condition both players', 'add an embedding'),
+    ('guidance knob', 'none built in', 'CFG scale'),
+    ('latent interpolation', 'native', 'via deterministic DDIM'),
+]
+for a, b, c in rows:
+    print(f'{a:26} {b:>22} {c:>22}')
+
+print('\nThe honest summary: diffusion wins on everything except speed, and speed is the reason')
+print('GANs are still used for real-time work (super-resolution, vocoders, on-device).')
+print('\nAnd the reason this chapter was short: you already had the U-Net (ch 6), the training')
+print('loop (ch 4), the conditioning trick (ch 7), and the normalization discipline (ch 1).')
+print('Diffusion is those pieces plus one closed-form equation.')
+
+#%% md
+## What to remember
+
+| Idea | The one-liner |
+|---|---|
+| Forward process | $x_t = \sqrt{\bar\alpha_t}x_0 + \sqrt{1-\bar\alpha_t}\varepsilon$ - closed form, any $t$, no loop |
+| $\bar\alpha_t$ | the signal-to-noise ratio at step $t$; the schedule *is* $\bar\alpha$ |
+| Training | random $t$ **per image**, add known noise, `F.mse_loss(model(xt, t), noise)` |
+| Why predict $\varepsilon$ | constant target scale across all $t$, so no noise level dominates |
+| Sampling | subtract predicted noise, **add fresh noise back**, repeat |
+| Without added noise | the sampler collapses to the data mean - chapter 7's blur, again |
+| Schedules | cosine beats linear; check that $x_{T/2}$ is genuinely ambiguous |
+| Time conditioning | sinusoidal embedding -> MLP -> **added to every residual block** |
+| Architecture | ch 6's U-Net + GroupNorm + residual blocks + attention at low res |
+| DDIM | deterministic reverse process -> skip steps, ~20x faster, reproducible seeds |
+| Hardest timesteps | **small** $t$ - little noise is hard to pin down exactly |
+| Conditioning | add a class embedding to the time embedding |
+| Classifier-free guidance | train with 10% null labels, then extrapolate; $w$ trades diversity for fidelity |
+| Latent diffusion | the same thing in a compressed autoencoder space - that's Stable Diffusion |
+
+Now do [`exercises/ex08_diffusion.ipynb`](../exercises/ex08_diffusion.ipynb).
+
+Then read the end of [`docs/08_diffusion.md`](../docs/08_diffusion.md) - **that's the course.**

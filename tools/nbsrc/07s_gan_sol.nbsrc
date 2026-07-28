@@ -1,0 +1,645 @@
+#out exercises/solutions/sol07_gan.ipynb
+#gpu on
+
+#%% md
+# Solutions 7 - GANs (FashionMNIST)
+
+Answers to [`ex07_gan.ipynb`](../ex07_gan.ipynb), with reasoning.
+
+> **GPU: Runtime -> Change runtime type -> T4 GPU.**
+
+#%% code
+import time, math
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from torchvision.utils import make_grid
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print('torch', torch.__version__, '| device', device)
+
+try:
+    import google.colab  # noqa: F401
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+DATA_DIR = '/content/data' if IN_COLAB else './data'
+NUM_WORKERS = 2 if IN_COLAB else 0
+
+def set_seed(seed=0):
+    import random
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+set_seed(0)
+torch.backends.cudnn.benchmark = True
+plt.rcParams['figure.dpi'] = 110
+IMG_SIZE, Z_DIM, BATCH, N_CLASSES = 32, 100, 128, 10
+
+def to_img(t):
+    return ((t.detach().cpu() + 1) / 2).clamp(0, 1)
+
+def show_grid(t, nrow=8, title='', figsize=(7, 7)):
+    g = make_grid(to_img(t), nrow=nrow, padding=2)
+    plt.figure(figsize=figsize); plt.imshow(g.permute(1, 2, 0).numpy(), cmap='gray')
+    plt.axis('off'); plt.title(title); plt.show()
+
+#%% md
+---
+## Task 1 - Data in [-1, 1]
+
+#%% code
+tf = transforms.Compose([
+    transforms.Resize(IMG_SIZE),
+    transforms.ToTensor(),                        # [0, 1]
+    transforms.Normalize((0.5,), (0.5,)),         # (x - 0.5) / 0.5 -> [-1, 1]
+])
+
+train_ds = datasets.FashionMNIST(DATA_DIR, train=True, download=True, transform=tf)
+loader = DataLoader(train_ds, batch_size=BATCH, shuffle=True, num_workers=NUM_WORKERS,
+                    pin_memory=device.type == 'cuda', drop_last=True)
+CLASSES = train_ds.classes
+xb, yb = next(iter(loader))
+assert xb.min() < -0.9 and xb.max() > 0.9
+print(f'PASS  range ({xb.min():.2f}, {xb.max():.2f}) | classes {CLASSES}')
+
+#%% md
+### What breaks with data in [0,1] and a tanh generator
+
+Training still "works" and the loss still moves, but you have handed the discriminator a
+**free giveaway feature**: every real image is non-negative, and the generator's `tanh` output is
+symmetric about 0, so roughly half of its pixels start negative. $D$ learns "any negative pixel ⇒
+fake" in about ten steps, reaches 100% accuracy, and $G$'s gradient dies.
+
+$G$ *can* eventually push everything positive (tanh reaches $[0,1]$ as a sub-range), so this is a
+handicap rather than an impossibility — which is worse, because it looks like a hyperparameter
+problem. The reverse mistake is a true impossibility: data in $[-1,1]$ with a **`sigmoid`** generator
+means every negative target is permanently unreachable.
+
+**The general rule: the generator's output activation and the data normalization are one decision, not
+two.** `tanh` ⇒ `Normalize((0.5,), (0.5,))`. `sigmoid` ⇒ leave the data in $[0,1]$. And whatever you
+choose, your display function must invert it — the `to_img` helper here does `(t+1)/2` for exactly
+that reason.
+
+#%% md
+---
+## Task 2 - Generator
+
+#%% code
+class Generator(nn.Module):
+    def __init__(self, z_dim=Z_DIM, base=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.ConvTranspose2d(z_dim, 4 * base, 4, 1, 0, bias=False),      # (N,z,1,1) -> 4x4
+            nn.BatchNorm2d(4 * base), nn.ReLU(True),
+            nn.ConvTranspose2d(4 * base, 2 * base, 4, 2, 1, bias=False),   # -> 8x8
+            nn.BatchNorm2d(2 * base), nn.ReLU(True),
+            nn.ConvTranspose2d(2 * base, base, 4, 2, 1, bias=False),       # -> 16x16
+            nn.BatchNorm2d(base), nn.ReLU(True),
+            nn.ConvTranspose2d(base, 1, 4, 2, 1, bias=False),              # -> 32x32
+            nn.Tanh(),
+        )
+
+    def forward(self, z):
+        return self.net(z.view(z.size(0), -1, 1, 1))
+
+
+def dcgan_init(m):
+    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+        nn.init.normal_(m.weight, 0.0, 0.02)
+    elif isinstance(m, nn.BatchNorm2d):
+        nn.init.normal_(m.weight, 1.0, 0.02); nn.init.zeros_(m.bias)
+
+
+G = Generator().to(device); G.apply(dcgan_init)
+with torch.no_grad():
+    out = G(torch.randn(4, Z_DIM, device=device))
+assert out.shape == (4, 1, 32, 32) and out.min() >= -1 and out.max() <= 1
+assert sum(1 for m in G.modules() if isinstance(m, nn.BatchNorm2d)) == 3
+print(f'PASS  {sum(p.numel() for p in G.parameters()):,} params, out ({out.min():.2f}, {out.max():.2f})')
+
+#%% md
+### Why these numbers
+
+**The first layer is `(4, 1, 0)`, the rest are `(4, 2, 1)`.** Transposed convolution's output size is
+`(in - 1) * stride - 2*padding + kernel`. Check them:
+
+- layer 1: `(1-1)*1 - 0 + 4 = 4` — projects the 1x1 noise vector to a 4x4 spatial map
+- layers 2-4: `(4-1)*2 - 2 + 4 = 8`, then 16, then 32 — each exactly doubles
+
+**Kernel 4 with stride 2 is not arbitrary.** Checkerboard artifacts appear when `kernel % stride != 0`,
+because output pixels then receive unequal numbers of contributions. `4 % 2 == 0`, so every output
+pixel gets the same count. Using kernel 3 stride 2 here produces a visible grid pattern in the samples
+— a distinctive, once-seen-never-forgotten artifact.
+
+**No BatchNorm on the output layer.** BN would renormalize away the mean and scale that `tanh` needs to
+place the image in $[-1,1]$, fighting the output activation.
+
+**`bias=False` before BatchNorm** — chapter 3's rule, unchanged: BN's learned shift makes the conv bias
+redundant.
+
+**Init `N(0, 0.02)`.** Unusually specific, and it genuinely matters here. PyTorch's default Kaiming init
+is tuned for discriminative depth; GAN training is a delicate balance and large initial weights let one
+player race ahead in the first few hundred steps, from which the other never recovers. The BN weight
+init at `N(1, 0.02)` keeps the scale near identity.
+
+**`ReLU` in G but `LeakyReLU` in D.** Asymmetric on purpose: G is fed a clean gradient from D, but D's
+gradient is G's *only* teacher, so D must never zero it out.
+
+#%% md
+---
+## Task 3 - Discriminator
+
+#%% code
+class Discriminator(nn.Module):
+    def __init__(self, base=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, base, 4, 2, 1, bias=False),                       # 32 -> 16
+            nn.LeakyReLU(0.2, True),                                       # no BN on the first layer
+            nn.Conv2d(base, 2 * base, 4, 2, 1, bias=False),                # -> 8
+            nn.BatchNorm2d(2 * base), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(2 * base, 4 * base, 4, 2, 1, bias=False),            # -> 4
+            nn.BatchNorm2d(4 * base), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(4 * base, 1, 4, 1, 0, bias=False),                   # -> 1x1
+        )
+
+    def forward(self, x):
+        return self.net(x).view(-1, 1)
+
+
+D = Discriminator().to(device); D.apply(dcgan_init)
+bce = nn.BCEWithLogitsLoss()
+with torch.no_grad():
+    fake = G(torch.randn(BATCH, Z_DIM, device=device))
+    d0 = (bce(D(xb.to(device)), torch.ones(BATCH, 1, device=device))
+          + bce(D(fake), torch.zeros(BATCH, 1, device=device))).item()
+print(f'PASS  {sum(p.numel() for p in D.parameters()):,} params | initial d_loss {d0:.4f} vs 2ln2 {2 * math.log(2):.4f}')
+
+#%% md
+### Why no BatchNorm on D's first layer
+
+BatchNorm normalizes each channel to zero mean and unit variance **using the statistics of the batch**.
+The first layer sees the raw images — and the real/fake distinction at that point lives partly in exactly
+those statistics (mean brightness, contrast). Normalizing them away discards the evidence.
+
+There is a second, subtler problem: in the standard loop, $D$ sees an all-real batch and then an
+all-fake batch. BatchNorm's statistics therefore differ between the two calls, which leaks batch
+identity and lets $D$ "cheat" in a way that transfers no useful gradient to $G$. This is why modern GANs
+often use **InstanceNorm**, **LayerNorm**, or **spectral normalization** in $D$ instead of BatchNorm
+throughout.
+
+**`LeakyReLU(0.2)`, not ReLU.** $D$'s gradient with respect to its *input* is what trains $G$. Dead ReLU
+units pass back exactly zero, so any region of the image where $D$'s features are negative contributes
+nothing to $G$'s learning signal. The 0.2 slope keeps a path open everywhere.
+
+**One logit, no sigmoid.** `BCEWithLogitsLoss` fuses the sigmoid for numerical stability (chapter 2). A
+confidently-wrong `sigmoid` output rounds to exactly 0 or 1 in float32, and `log(0)` is `-inf` — and a
+discriminator becoming confident is the normal course of GAN training, so this is not a hypothetical.
+
+#%% md
+---
+## Task 4 - The three bugs
+
+```python
+opt_D.zero_grad()
+d_loss = bce(D(real), ones) + bce(D(fake), zeros)   # BUG 1: fake is not detached
+d_loss.backward()
+opt_D.step()
+
+g_loss = -bce(D(fake), zeros)                       # BUG 2: negated saturating loss
+g_loss.backward()
+opt_G.zero_grad()                                   # BUG 3: clears the gradient it just computed
+opt_G.step()
+```
+
+**Bug 1 — no `.detach()` on the fake batch.** The D loss backpropagates through $D$ *and into* $G$. The
+gradient sitting in `G.parameters()` is then $\partial(\text{D's objective})/\partial G$ — i.e. "make the
+fakes easier to detect". It gets applied on the next `opt_G.step()`, and $G$ actively trains itself to
+be worse. Nothing raises.
+
+**Bug 2 — the negated saturating loss.** `-bce(D(fake), zeros)` is the literal minimax form
+$-\log(1-D(G(z)))$ up to sign, and its gradient **vanishes** exactly when $D$ is winning, which is
+always true early on. Worse, maximizing a BCE term is unbounded below, so this frequently drives the
+loss toward $-\infty$ and the weights to `nan`. Correct: `bce(D(fake), ones)` — the non-saturating form,
+same fixed point, healthy gradient.
+
+**Bug 3 — `zero_grad()` after `backward()`.** It wipes the gradient that was just computed, so
+`opt_G.step()` applies nothing and $G$ **never updates at all**. This is the mirror image of chapter 4's
+missing-`zero_grad` bug, and the reason to always put `zero_grad()` at the *top* of a step: the order is
+then correct no matter what you add below it.
+
+A fourth, non-bug worth noticing: reusing `fake` for the G step after `opt_D.step()` means $D$ has
+already changed. That's standard and fine — it saves a generator forward pass. Recomputing
+`fake = G(z)` is also fine.
+
+#%% code
+def train_gan(epochs=6, lr=2e-4, real_label=0.9, log=True):
+    set_seed(0)
+    G, D = Generator().to(device), Discriminator().to(device)
+    G.apply(dcgan_init); D.apply(dcgan_init)
+    opt_G = torch.optim.Adam(G.parameters(), lr=lr, betas=(0.5, 0.999))
+    opt_D = torch.optim.Adam(D.parameters(), lr=lr, betas=(0.5, 0.999))
+    bce = nn.BCEWithLogitsLoss()
+    hist = {'d_loss': [], 'g_loss': [], 'acc_real': [], 'acc_fake': []}
+
+    for epoch in range(epochs):
+        t0 = time.perf_counter()
+        ep = {k: 0.0 for k in hist}
+        nb = 0
+        for real, _ in loader:
+            real = real.to(device, non_blocking=True)
+            n = real.size(0)
+            ones = torch.full((n, 1), real_label, device=device)      # one-sided label smoothing
+            zeros = torch.zeros(n, 1, device=device)
+            fake = G(torch.randn(n, Z_DIM, device=device))
+
+            opt_D.zero_grad(set_to_none=True)                          # fix 3: zero_grad at the TOP
+            out_real, out_fake = D(real), D(fake.detach())             # fix 1: detach
+            d_loss = bce(out_real, ones) + bce(out_fake, zeros)
+            d_loss.backward()
+            opt_D.step()
+
+            opt_G.zero_grad(set_to_none=True)
+            g_loss = bce(D(fake), torch.ones(n, 1, device=device))     # fix 2: non-saturating
+            g_loss.backward()
+            opt_G.step()
+
+            ep['d_loss'] += d_loss.item(); ep['g_loss'] += g_loss.item()
+            ep['acc_real'] += (out_real > 0).float().mean().item()
+            ep['acc_fake'] += (out_fake > 0).float().mean().item()
+            nb += 1
+        for k in hist:
+            hist[k].append(ep[k] / nb)
+        if log:
+            print(f'  ep {epoch}: d {hist["d_loss"][-1]:.3f} g {hist["g_loss"][-1]:.3f} '
+                  f'| D real {hist["acc_real"][-1]:.3f} fooled {hist["acc_fake"][-1]:.3f} '
+                  f'| {time.perf_counter() - t0:.0f}s')
+    return G, D, hist
+
+
+EPOCHS = 6
+print(f'training {EPOCHS} epochs:')
+G, D, hist = train_gan(EPOCHS)
+G.eval()
+with torch.no_grad():
+    samples = G(torch.randn(64, Z_DIM, device=device))
+assert hist['acc_fake'][-1] > 0.05 and samples.std().item() > 0.2
+print('PASS')
+show_grid(samples, nrow=8, title=f'64 samples after {EPOCHS} epochs')
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.4))
+axes[0].plot(hist['d_loss'], marker='o', label='D'); axes[0].plot(hist['g_loss'], marker='s', label='G')
+axes[0].axhline(2 * math.log(2), ls=':', c='k', label='2ln2'); axes[0].set_title('losses')
+axes[1].plot(hist['acc_real'], marker='o', label='D correct on real')
+axes[1].plot(hist['acc_fake'], marker='s', label='D fooled')
+axes[1].axhline(0.5, ls=':', c='k'); axes[1].set_title('the useful diagnostic')
+for ax in axes:
+    ax.set_xlabel('epoch'); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+plt.tight_layout()
+
+#%% md
+---
+## Task 5 - Diversity
+
+#%% code
+def diversity(batch):
+    flat = batch.view(batch.size(0), -1)
+    n = flat.size(0)
+    d = torch.cdist(flat, flat)
+    mean_pairwise = (d.sum() / (n * (n - 1))).item()      # exclude the zero diagonal
+    return mean_pairwise, batch.std(dim=0).mean().item()
+
+
+real_batch = next(iter(loader))[0].to(device)
+with torch.no_grad():
+    fake_batch = G(torch.randn(real_batch.size(0), Z_DIM, device=device))
+collapsed = fake_batch[:1].repeat(real_batch.size(0), 1, 1, 1)
+dr, sr = diversity(real_batch); df, sf = diversity(fake_batch); dc, sc = diversity(collapsed)
+assert dc < 1e-4
+print(f'{"real":18} pairwise {dr:8.3f} | px std {sr:.4f}')
+print(f'{"generated":18} pairwise {df:8.3f} | px std {sf:.4f}')
+print(f'{"collapsed":18} pairwise {dc:8.3f} | px std {sc:.4f}')
+print(f'ratio {df / dr:.3f}')
+print('PASS')
+
+#%% md
+### Why these two numbers, and what they miss
+
+**Excluding the diagonal matters.** `cdist(x, x)` has $n$ zeros on its diagonal. Dividing the sum by
+$n^2$ instead of $n(n-1)$ biases every measurement downward by a factor $(n-1)/n$ — small at $n=128$,
+but it means "real data" and "generated" are both wrong by the same amount, which is exactly the sort of
+error that survives review because the *ratio* still looks fine.
+
+**Two measures because they fail differently.** Pairwise distance catches "all samples are the same
+image". Per-pixel std catches "all samples share a fixed background/structure" even when they differ
+somewhere. A generator that outputs the same silhouette with different noise scores well on one and
+badly on the other.
+
+**Always normalize against real data.** The absolute pairwise distance means nothing — it depends on
+image size, contrast, and normalization. The *ratio* to real data is interpretable: >0.7 healthy, <0.4
+suspicious.
+
+**What this cannot see: partial mode collapse.** A generator covering 6 of 10 classes can have a
+perfectly healthy diversity ratio, because the 6 classes it does produce are varied. That is the common
+real failure and it needs task 6's classifier.
+
+#%% md
+---
+## Task 6 - Which classes did it learn?
+
+#%% code
+def train_classifier(epochs=2):
+    set_seed(1)
+    clf = nn.Sequential(
+        nn.Conv2d(1, 32, 3, padding=1, bias=False), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
+        nn.Conv2d(32, 64, 3, padding=1, bias=False), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
+        nn.Conv2d(64, 128, 3, padding=1, bias=False), nn.BatchNorm2d(128), nn.ReLU(),
+        nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(128, N_CLASSES),
+    ).to(device)
+    opt = torch.optim.AdamW(clf.parameters(), lr=2e-3)
+    crit = nn.CrossEntropyLoss()
+    acc = 0.0
+    for ep in range(epochs):
+        clf.train()
+        corr = seen = 0
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            opt.zero_grad(set_to_none=True)
+            logits = clf(x)
+            crit(logits, y).backward()
+            opt.step()
+            corr += (logits.argmax(1) == y).sum().item(); seen += y.size(0)
+        acc = corr / seen
+    return clf.eval(), acc
+
+
+clf, clf_acc = train_classifier()
+print(f'classifier train accuracy {clf_acc:.4f}')
+assert clf_acc > 0.85
+
+with torch.no_grad():
+    gen = torch.cat([G(torch.randn(100, Z_DIM, device=device)) for _ in range(10)])
+    pred = clf(gen).argmax(1).cpu().numpy()
+gen_hist = np.bincount(pred, minlength=N_CLASSES) / len(pred)
+
+print(f'\n{"class":16} {"generated":>10} {"real":>7}')
+for i, c in enumerate(CLASSES):
+    flag = '  <- under' if gen_hist[i] < 0.05 else ('  <- over' if gen_hist[i] > 0.18 else '')
+    print(f'{c:16} {gen_hist[i]:10.3f} {0.100:7.3f}{flag}')
+print(f'\nmax deviation from uniform {np.abs(gen_hist - 0.1).max():.3f}')
+print(f'missing (<2%): {[CLASSES[i] for i in range(10) if gen_hist[i] < 0.02]}')
+
+plt.figure(figsize=(7, 3))
+plt.bar(np.arange(10) - 0.2, gen_hist, width=0.4, label='generated')
+plt.bar(np.arange(10) + 0.2, np.full(10, 0.1), width=0.4, label='real (uniform)')
+plt.xticks(range(10), CLASSES, rotation=45, ha='right', fontsize=8)
+plt.ylabel('fraction'); plt.legend(fontsize=8); plt.tight_layout()
+
+#%% md
+### Reading the histogram
+
+Typical result after 6 epochs: the distinctive silhouettes (**Trouser**, **Bag**, **Sandal**,
+**Ankle boot**) are over-represented, and the three confusable tops (**Shirt**, **Pullover**,
+**Coat**) are under-represented — sometimes one of them nearly absent.
+
+Why those, specifically? The generator is optimizing "fool $D$", not "cover the data". If shirts,
+pullovers and coats are hard to render convincingly, $G$ can lower its loss by producing *more trousers*
+instead. Nothing in the GAN objective penalises abandoning a mode — this is the structural weakness of
+adversarial training, and precisely where diffusion models (chapter 8) do better: their loss is a
+per-sample regression over the *whole* dataset, so ignoring a subset is directly penalised.
+
+**Why use a classifier for this.** It's a proxy — a self-supervised way to ask "what did the generator
+produce?" when the fakes have no labels. It's exactly the mechanism behind **Inception Score**, and it
+inherits the same caveat: the classifier's own confusions (shirt vs coat) blur the histogram, so
+under-representation of a confusable class is partly measurement error. Read big deviations, not small
+ones.
+
+**Fixes for partial collapse**, in rough order: train longer (the cheapest and often sufficient answer
+at 6 epochs), lower $G$'s learning rate relative to $D$'s, minibatch discrimination (let $D$ see a whole
+batch so it can punish repetition), unrolled GANs, or switch to WGAN-GP. Or make it **conditional**
+(task 8) — conditioning forces coverage, since $D$ sees the requested label.
+
+#%% md
+---
+## Task 7 - Interpolation
+
+#%% code
+def interp_z(z_a, z_b, steps=10, spherical=True):
+    """Just the latent path, so we can measure its norms."""
+    ts = torch.linspace(0, 1, steps, device=z_a.device).view(-1, 1)
+    if spherical:
+        a, b = z_a / z_a.norm(), z_b / z_b.norm()
+        omega = torch.acos((a * b).sum().clamp(-1, 1))     # clamp: acos(1.0000001) is nan
+        so = torch.sin(omega)
+        return (torch.sin((1 - ts) * omega) / so) * z_a + (torch.sin(ts * omega) / so) * z_b
+    return (1 - ts) * z_a + ts * z_b
+
+
+@torch.no_grad()
+def interpolate(G, z_a, z_b, steps=10, spherical=True):
+    return G(interp_z(z_a, z_b, steps, spherical))
+
+
+set_seed(5)
+za, zb = torch.randn(Z_DIM, device=device), torch.randn(Z_DIM, device=device)
+lin, sph = interpolate(G, za, zb, 10, False), interpolate(G, za, zb, 10, True)
+assert torch.allclose(lin[0], sph[0], atol=1e-4)
+
+lin_norms = interp_z(za, zb, 10, False).norm(dim=1)
+sph_norms = interp_z(za, zb, 10, True).norm(dim=1)
+print(f'PASS  |za| {za.norm():.2f}  |zb| {zb.norm():.2f}  (sqrt({Z_DIM}) = {math.sqrt(Z_DIM):.1f})')
+print(f'  linear path norms:    {np.round(lin_norms.cpu().numpy(), 2)}')
+print(f'  spherical path norms: {np.round(sph_norms.cpu().numpy(), 2)}   <- constant')
+print(f'  linear midpoint is {100 * (1 - lin_norms.min() / za.norm()):.0f}% shorter than the endpoints,')
+print('  which puts it in a region of latent space the generator never saw during training.')
+
+fig, axes = plt.subplots(2, 10, figsize=(13, 2.9))
+for c in range(10):
+    axes[0, c].imshow(to_img(lin[c])[0].numpy(), cmap='gray')
+    axes[1, c].imshow(to_img(sph[c])[0].numpy(), cmap='gray')
+for ax in axes.ravel(): ax.axis('off')
+plt.suptitle('linear (top) vs spherical (bottom)')
+plt.tight_layout()
+
+#%% md
+### Why the linear midpoint is off-distribution
+
+This is a genuinely counter-intuitive fact about high dimensions. For $z \sim \mathcal{N}(0, I_d)$,
+$\|z\|^2$ is chi-squared with $d$ degrees of freedom, so $\|z\| \approx \sqrt{d}$ with *relative*
+spread shrinking as $d$ grows. At $d = 100$, essentially all the probability mass sits in a thin shell
+of radius ≈ 10. **The Gaussian is a soap bubble, not a ball** — the origin, despite being the mode of
+the density, is a region the generator never sees.
+
+Two independent draws are near-orthogonal (also a high-dimensional fact), so their midpoint has norm
+
+$$\left\|\frac{z_a + z_b}{2}\right\| \approx \frac{\sqrt{\|z_a\|^2 + \|z_b\|^2}}{2} \approx \frac{\sqrt{2d}}{2} = \frac{\sqrt{d}}{\sqrt{2}} \approx 0.71\sqrt{d}$$
+
+So the linear midpoint sits ~29% inside the shell, in a region with vanishing training density. The
+generator's behaviour there is undefined-by-omission, and in practice you get low-contrast, washed-out,
+"averaged" images — visibly different from the endpoints.
+
+**Slerp** (spherical linear interpolation) moves along the great circle between the two vectors,
+preserving the norm at every step, so every intermediate point is as plausible as the endpoints.
+
+$$\text{slerp}(z_a, z_b; t) = \frac{\sin((1-t)\Omega)}{\sin \Omega} z_a + \frac{\sin(t\Omega)}{\sin \Omega} z_b, \quad \Omega = \arccos\left(\frac{z_a \cdot z_b}{\|z_a\|\|z_b\|}\right)$$
+
+Implementation details: `.clamp(-1, 1)` before `acos` (floating point can give 1.0000001, and `acos`
+returns `nan`), and note that $\Omega \approx \pi/2$ for random high-dimensional draws — so `sin(omega)`
+is safely near 1 and the division is stable. It degenerates only for nearly parallel vectors, where
+linear interpolation would have been fine anyway.
+
+This is standard practice in generative work — the same reason Stable Diffusion interfaces slerp between
+seeds rather than averaging them.
+
+#%% md
+---
+## Task 8 - Conditional GAN
+
+#%% code
+EMB = 32
+
+class CondGenerator(nn.Module):
+    def __init__(self, z_dim=Z_DIM, base=64, emb=EMB):
+        super().__init__()
+        self.emb = nn.Embedding(N_CLASSES, emb)
+        self.net = nn.Sequential(
+            nn.ConvTranspose2d(z_dim + emb, 4 * base, 4, 1, 0, bias=False),
+            nn.BatchNorm2d(4 * base), nn.ReLU(True),
+            nn.ConvTranspose2d(4 * base, 2 * base, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(2 * base), nn.ReLU(True),
+            nn.ConvTranspose2d(2 * base, base, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(base), nn.ReLU(True),
+            nn.ConvTranspose2d(base, 1, 4, 2, 1, bias=False),
+            nn.Tanh(),
+        )
+
+    def forward(self, z, y):
+        h = torch.cat([z, self.emb(y)], dim=1)
+        return self.net(h.view(h.size(0), -1, 1, 1))
+
+
+class CondDiscriminator(nn.Module):
+    def __init__(self, base=64):
+        super().__init__()
+        self.emb = nn.Embedding(N_CLASSES, IMG_SIZE * IMG_SIZE)      # label -> an extra channel
+        self.net = nn.Sequential(
+            nn.Conv2d(2, base, 4, 2, 1, bias=False), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(base, 2 * base, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(2 * base), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(2 * base, 4 * base, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(4 * base), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(4 * base, 1, 4, 1, 0, bias=False),
+        )
+
+    def forward(self, x, y):
+        y_map = self.emb(y).view(-1, 1, IMG_SIZE, IMG_SIZE)
+        return self.net(torch.cat([x, y_map], dim=1)).view(-1, 1)
+
+
+def train_cgan(epochs=6, lr=2e-4, real_label=0.9):
+    set_seed(0)
+    cG, cD = CondGenerator().to(device), CondDiscriminator().to(device)
+    cG.apply(dcgan_init); cD.apply(dcgan_init)
+    opt_G = torch.optim.Adam(cG.parameters(), lr=lr, betas=(0.5, 0.999))
+    opt_D = torch.optim.Adam(cD.parameters(), lr=lr, betas=(0.5, 0.999))
+    bce = nn.BCEWithLogitsLoss()
+    hist = {'d_loss': [], 'g_loss': [], 'acc_fake': []}
+    for epoch in range(epochs):
+        t0 = time.perf_counter()
+        dl = gl = af = 0.0
+        nb = 0
+        for real, y in loader:
+            real, y = real.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            n = real.size(0)
+            ones = torch.full((n, 1), real_label, device=device)
+            zeros = torch.zeros(n, 1, device=device)
+            y_fake = torch.randint(0, N_CLASSES, (n,), device=device)
+            fake = cG(torch.randn(n, Z_DIM, device=device), y_fake)
+
+            opt_D.zero_grad(set_to_none=True)
+            out_fake = cD(fake.detach(), y_fake)
+            d_loss = bce(cD(real, y), ones) + bce(out_fake, zeros)
+            d_loss.backward(); opt_D.step()
+
+            opt_G.zero_grad(set_to_none=True)
+            g_loss = bce(cD(fake, y_fake), torch.ones(n, 1, device=device))
+            g_loss.backward(); opt_G.step()
+
+            dl += d_loss.item(); gl += g_loss.item(); af += (out_fake > 0).float().mean().item(); nb += 1
+        hist['d_loss'].append(dl / nb); hist['g_loss'].append(gl / nb); hist['acc_fake'].append(af / nb)
+        print(f'  ep {epoch}: d {dl / nb:.3f} g {gl / nb:.3f} fooled {af / nb:.3f} | {time.perf_counter() - t0:.0f}s')
+    return cG, hist
+
+
+print('training the conditional GAN:')
+cG, chist = train_cgan(6)
+cG.eval()
+with torch.no_grad():
+    probe = cG(torch.randn(1, Z_DIM, device=device).repeat(N_CLASSES, 1),
+               torch.arange(N_CLASSES, device=device))
+    match = (clf(probe).argmax(1).cpu().numpy() == np.arange(N_CLASSES)).mean()
+print(f'classifier agrees with the request {match * 100:.0f}% of the time')
+
+with torch.no_grad():
+    ys = torch.arange(N_CLASSES, device=device).repeat_interleave(10)
+    zs = torch.randn(10, Z_DIM, device=device).repeat(N_CLASSES, 1)
+    grid = cG(zs, ys)
+g = make_grid(to_img(grid), nrow=10, padding=2)
+plt.figure(figsize=(8, 8)); plt.imshow(g.permute(1, 2, 0).numpy(), cmap='gray'); plt.axis('off')
+plt.title('row i = requested class i (columns share z)')
+plt.show()
+for i, c in enumerate(CLASSES):
+    print(f'  row {i}: {c}')
+
+#%% md
+### What happens if only G sees the label
+
+**Nothing forces $G$ to use it.** The label becomes 32 extra input dimensions that $G$ is free to ignore,
+because the only pressure on $G$ is "make $D$ output 1", and a $D$ that never sees labels cannot object
+to a beautiful sneaker submitted as class "Bag". The most likely outcome is that $G$ learns to ignore the
+embedding entirely and you have an unconditional GAN with wasted parameters. (Occasionally $G$ *does* use
+it, as a source of extra randomness — which is worse, because it looks like it works until you check.)
+
+With $D$ conditioned, the game changes: a mismatched (image, label) pair is now something $D$ can learn
+to reject, so $G$ is penalised for ignoring the label. **This is the general principle of conditional
+generative modelling — condition the critic, not just the generator.**
+
+Two implementation notes:
+
+- **`y_fake` is sampled randomly, not reused from the real batch.** Using the real batch's labels also
+  works, but sampling independently decouples the conditioning distribution from the batch and makes the
+  intent explicit.
+- **Conditioning $D$ via an extra image channel** (`Embedding(10, 32*32)` reshaped) is the simplest
+  method and fine at this scale. It costs 10,240 parameters and treats the label as a spatial map, which
+  is wasteful. Better modern options: **projection discriminator** (inner product between the label
+  embedding and $D$'s features) or an **auxiliary classifier** (AC-GAN: $D$ also predicts the class). For
+  $G$, **conditional BatchNorm** / FiLM — modulating normalization parameters per class — beats
+  concatenation and is what StyleGAN-family models use.
+
+Also worth noticing in the grid: columns share a latent $z$, and you can see what $z$ controls
+independently of the label — overall brightness, width, texture. **The label says *what*, $z$ says
+*how*.** That factorization is the same idea as classifier-free guidance in chapter 8, and the same idea
+as a prompt plus a seed in a text-to-image model.
+
+#%% md
+---
+## The chapter in one line
+
+**When you can't write down the loss, learn it** — and pay for that with instability that no loss curve
+will diagnose for you.
+
+The habits worth carrying forward:
+
+1. **Look at samples**, on a fixed noise vector, every epoch. It is the only reliable progress signal.
+2. **Watch $D$'s accuracy, not the losses.** Pinned at 1.0 means your teacher stopped teaching.
+3. **Measure diversity**, and measure class coverage with a classifier. Collapse is invisible in the loss.
+4. **Match your output activation to your data normalization.** One decision, not two.
+5. **`zero_grad()` at the top of every step**, so adding a line below can't break it.
+
+Next: [Chapter 8 - Diffusion models](../../docs/08_diffusion.md), which generates better images with a
+loss so boring (MSE on noise) that none of this drama exists.
